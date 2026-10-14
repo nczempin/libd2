@@ -2785,6 +2785,52 @@ fn appendOutdoorShrines(pLevel: *abi.D2DrlgLevelStrc, out: *std.ArrayListUnmanag
     }
 }
 
+/// Emit the generator-placed waypoint of an Act-1/2 wilderness level. The waypoint comes
+/// from the FIRST SubTypeWpShrine (006707a0) call of InitGridCells (0067d2d0): for a room
+/// whose eRoomExFlags carry waypoint bits (one bit per consecutive LvlSub row of the level's
+/// LvlDefs.SubWaypoint type), DoNotCheckAll (00670170) places a substitution group of the
+/// row's DS1, and ApplyLvlSubTileData copies the DS1's objects into the room. The placement
+/// is taken from the room build itself (materialize.waypointPlacements, which runs the real
+/// CheckSubTileOverlap against the room's grids); the waypoint is the copied object whose
+/// Objects.txt SubClass has bit 0x40, the test findWaypointRoomAndCoords (DrlgRoom.cpp:290)
+/// applies. x/y are world SUBTILE coords.
+fn appendOutdoorWaypoints(pLevel: *abi.D2DrlgLevelStrc, out: *std.ArrayListUnmanaged(OutdoorShrine), a: std.mem.Allocator) !void {
+    if (pLevel.eDrlgType != .wilderness) return;
+    var pr: ?*abi.D2RoomExStrc = pLevel.pRoomExFirst;
+    while (pr) |p| : (pr = p.pRoomExNext) {
+        if (@as(u8, p.eRoomExFlags.waypoint) == 0) continue;
+        const cap = try materialize.waypointPlacements(a, pLevel, p);
+        for (cap.items[0..cap.n]) |placed| {
+            const d = preset.cachedDs1(std.mem.sliceTo(&placed.pSubTxt.File, 0)) orelse continue;
+            if (placed.group >= d.subst_groups.len) continue;
+            const g = d.subst_groups[placed.group];
+            for (d.objects) |o| {
+                if (o.kind != 2) continue;
+                const class_id = presettables.objectClassId(d.act_id, o.id);
+                if (!isWaypointClass(class_id)) continue;
+                // Object position relative to the substitution group's box, in subtiles.
+                const lx = o.x - @as(i32, @intCast(g.x)) * SUB;
+                const ly = o.y - @as(i32, @intCast(g.y)) * SUB;
+                if (lx < 0 or ly < 0 or lx >= @as(i32, @intCast(g.w)) * SUB or ly >= @as(i32, @intCast(g.h)) * SUB) continue;
+                try out.append(a, .{
+                    .class_id = class_id,
+                    .x = (p.sCoords.WorldPosition.x + placed.bx) * SUB + lx,
+                    .y = (p.sCoords.WorldPosition.y + placed.by) * SUB + ly,
+                });
+            }
+        }
+    }
+}
+
+/// Objects.txt rows flagged as waypoints: SubClass bit 0x40 within the first 0x23d rows,
+/// the test findWaypointRoomAndCoords (DrlgRoom.cpp:290) applies to a room's preset units.
+fn isWaypointClass(class_id: i32) bool {
+    if (class_id < 0 or class_id > 0x23c) return false;
+    const t = objTxt() orelse return false;
+    if (class_id >= t.rowCount()) return false;
+    return t.int(@intCast(class_id), "SubClass") & 0x40 != 0;
+}
+
 /// Generate an entire act and return the seeded OUTDOOR SHRINES/WELLS of one level
 /// (`level_id`). Mirrors the generateActObjects/collision setup (one fog pool + one
 /// D2DrlgStrc for the whole act, real inter-level coords + preset picks + orths), then
@@ -2878,6 +2924,8 @@ pub const PresetUnit = struct { etype: i32, txt_file_no: i32, x: i32, y: i32 };
 ///      over-include the (rare) filtered place-group/object classes.
 ///   3. Seeded outdoor shrines/wells (SpawnAct12Shrines) — folded in as eType 2 objects,
 ///      since DBM lists them in the same `presets` array.
+///   4. Act-1/2 wilderness waypoints (appendOutdoorWaypoints) — the object the waypoint
+///      sub-theme's DS1 places, at the position the outdoor room build chose for it.
 /// Caller owns the slice.
 pub fn generateLevelPresets(
     ctx: *Ctx,
@@ -3017,6 +3065,8 @@ fn collectLevelPresets(out_alloc: std.mem.Allocator, pLevel: *abi.D2DrlgLevelStr
     var shrines: std.ArrayListUnmanaged(OutdoorShrine) = .empty;
     defer shrines.deinit(out_alloc);
     try appendOutdoorShrines(pLevel, &shrines, out_alloc);
+    // Act-1/2 wilderness waypoints are placed by the same outdoor room build.
+    try appendOutdoorWaypoints(pLevel, &shrines, out_alloc);
     for (shrines.items) |sh|
         try Emit.add(out_alloc, &out, &seen, 2, sh.class_id, sh.x - ox, sh.y - oy, bw, bh);
 
@@ -3653,6 +3703,8 @@ pub fn generateActObjects(
         var shrines: std.ArrayListUnmanaged(OutdoorShrine) = .empty;
         defer shrines.deinit(out_alloc);
         try appendOutdoorShrines(pLevel, &shrines, out_alloc);
+        // Act-1/2 wilderness waypoints, placed by the same outdoor room build.
+        try appendOutdoorWaypoints(pLevel, &shrines, out_alloc);
 
         // Convert to the public ObjSpawn shape.
         const arr = try out_alloc.alloc(ObjSpawn, objs.items.len + shrines.items.len);
@@ -3749,3 +3801,38 @@ test "lib: Ctx round-trips + API type-checks" {
 
 
 
+
+test "lib: Act 1/2 wilderness waypoints are among the level presets" {
+    const gpa = std.testing.allocator;
+    var ctx = try Ctx.init(gpa);
+    defer ctx.deinit();
+    // Ground truth: waypoint object positions read from a live D2R game with map seed
+    // 472144551 (Normal), converted to level-local subtiles. Cold Plains needs the real
+    // CheckSubTileOverlap: the first shuffled position is rejected there.
+    const cases = [_]struct { act: i32, level: i32, class: i32, x: i32, y: i32 }{
+        .{ .act = 0, .level = 3, .class = 119, .x = 69, .y = 94 },
+        .{ .act = 0, .level = 4, .class = 119, .x = 179, .y = 139 },
+    };
+    for (cases) |c| {
+        const units = try generateLevelPresets(&ctx, gpa, c.act, 472144551, .normal, c.level);
+        defer gpa.free(units);
+        var found = false;
+        for (units) |u| {
+            if (u.etype == 2 and u.txt_file_no == c.class and u.x == c.x and u.y == c.y) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    // Every Act 1/2 wilderness level with a waypoint gets exactly one, for any seed.
+    const levels = [_]i32{ 3, 4, 5, 6, 42, 43, 44 };
+    for ([_]u32{ 1, 1337, 472144551 }) |seed| {
+        for (levels) |lid| {
+            const units = try generateLevelPresets(&ctx, gpa, if (lid < 40) 0 else 1, seed, .normal, lid);
+            defer gpa.free(units);
+            var n: usize = 0;
+            for (units) |u| {
+                if (u.etype == 2 and isWaypointClass(u.txt_file_no)) n += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), n);
+        }
+    }
+}

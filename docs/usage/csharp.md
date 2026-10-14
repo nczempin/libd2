@@ -62,9 +62,9 @@ foreach (var group in coldPlains.Presets
 1 x bed
 ```
 
-`Presets` is what the level's own map data places. Note that some things you might expect are
-not in there: a wilderness waypoint is positioned by the generator rather than by preset data,
-so it will not appear among a wilderness level's `Presets`.
+`Presets` is what the level's own map data places, plus the objects the outdoor room build adds:
+the seeded shrines and wells, and the waypoint of an Act I or Act II wilderness level, which the
+generator positions rather than the preset data.
 
 ## Where a level leads
 

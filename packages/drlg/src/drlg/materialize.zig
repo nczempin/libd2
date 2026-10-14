@@ -1602,6 +1602,42 @@ fn applySubTileFloor(
 // group, then either tries random positions (Trials >= 0) or shuffles all positions
 // exhaustively (Trials == -1), placing the group when overlap-free. Runs Max[nSubTypeIndex]
 // times. Faithful to the C reconstruction (same seed consumption order, same shuffle).
+/// Where the waypoint sub-theme pass (InitGridCells' first SubTypeWpShrine call) placed a
+/// substitution group: the LvlSub row, the rolled group index and the room-local tile
+/// position DoNotCheckAll accepted after CheckSubTileOverlap.
+pub const WaypointPlacement = struct { pSubTxt: *dtables.D2LvlSubTxt, group: usize, bx: i32, by: i32 };
+
+/// Up to two placements per room: the waypoint mask has one bit per consecutive LvlSub row.
+pub const WaypointCapture = struct {
+    n: usize = 0,
+    items: [2]WaypointPlacement = undefined,
+};
+
+threadlocal var g_wp_capture: ?*WaypointCapture = null;
+threadlocal var g_in_waypoint_pass: bool = false;
+
+fn recordWaypointPlacement(pSubTxt: *dtables.D2LvlSubTxt, group: usize, bx: i32, by: i32) void {
+    if (!g_in_waypoint_pass) return;
+    const cap = g_wp_capture orelse return;
+    if (cap.n >= cap.items.len) return;
+    cap.items[cap.n] = .{ .pSubTxt = pSubTxt, .group = group, .bx = bx, .by = by };
+    cap.n += 1;
+}
+
+/// Run a live wilderness floor room's grid build up to and including its waypoint pass,
+/// with the same inputs the collision path uses (ACT_I overlay included), and report where
+/// the waypoint substitution groups landed. The overlap check needs the room's real floor
+/// and wall grids, which is why this replays the build instead of re-rolling the position.
+pub fn waypointPlacements(a: std.mem.Allocator, pLevel: *s.D2DrlgLevelStrc, p: *s.D2RoomExStrc) !WaypointCapture {
+    var cap = WaypointCapture{};
+    if (@as(u8, p.eRoomExFlags.waypoint) == 0) return cap;
+    g_wp_capture = &cap;
+    defer g_wp_capture = null;
+    var r = try materializeOutdoorFloorRoom(a, &.{}, p.sCoords.WorldSize.x, p.sCoords.WorldSize.y, @intFromEnum(pLevel.nLevelType), @intFromEnum(pLevel.eD2LevelId), p.nSeed, outdoorOverlayFor(pLevel, p), -1, 0, 0, @intCast(@as(u8, p.eRoomExFlags.waypoint)), @intCast(@as(u8, p.eRoomExFlags.shrineRows)), null);
+    r.deinit(a);
+    return cap;
+}
+
 fn doNotCheckAll(
     pRoom: *s.D2RoomExStrc,
     fg: *s.D2DrlgGridStrc,
@@ -1663,6 +1699,7 @@ fn doNotCheckAll(
                         const bx: i32 = coordBuf[i * 2] + 1;
                         const by: i32 = coordBuf[i * 2 + 1] + 1;
                         if (checkSubTileOverlap(bx, by, fg, wg, pSubstGroup, pSubTxt)) {
+                            recordWaypointPlacement(pSubTxt, nGroupIdx, bx, by);
                             applySubTileFloor(pRoom, fg, wg, og, bx, by, pSubstGroup, pSubTxt);
                             break;
                         }
@@ -1675,6 +1712,7 @@ fn doNotCheckAll(
                     const bx: i32 = @intCast(drlg_rng.randomNumberSelector(&pRoom.sSeed, nMaxX) + 1);
                     const by: i32 = @intCast(drlg_rng.randomNumberSelector(&pRoom.sSeed, nMaxY) + 1);
                     if (checkSubTileOverlap(bx, by, fg, wg, pSubstGroup, pSubTxt)) {
+                        recordWaypointPlacement(pSubTxt, nGroupIdx, bx, by);
                         applySubTileFloor(pRoom, fg, wg, og, bx, by, pSubstGroup, pSubTxt);
                         break;
                     }
@@ -1822,7 +1860,11 @@ pub fn materializeOutdoorFloorRoom(
         pg.*.nRoofTilesMax = @intCast(n);
     }
     const pDef = dtables.levelDefsGetLine(@enumFromInt(level_id));
-    if (nWaypointCount != 0) applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, pDef.*.SubWaypoint, 0, nWaypointCount);
+    if (nWaypointCount != 0) {
+        g_in_waypoint_pass = true;
+        defer g_in_waypoint_pass = false;
+        applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, pDef.*.SubWaypoint, 0, nWaypointCount);
+    }
     if (nShrineCount != 0) applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, pDef.*.SubShrine, 0, nShrineCount);
     applySubThemeTerrain(&room, &fg.grid, &wg.grid, &og.grid, nSubType, nSubTheme, nSubThemePicked);
 
