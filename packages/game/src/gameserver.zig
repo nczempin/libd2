@@ -149,6 +149,12 @@ pub const Client = struct {
     book: ?sim.skill.SkillBook = null,
     /// The potions in the belt (see `BeltCell`).
     belt: [16]BeltCell = [_]BeltCell{.{}} ** 16,
+    /// How many of the belt's cells exist: Belts.txt numboxes of the worn belt, 4 with none.
+    belt_cells: u8 = 4,
+    /// The inventory grid (10 x 4, index y * 10 + x) by the item at each cell's top-left, and what
+    /// is worn by body location (`worn`). Item codes only: what the potions and the belt need.
+    bag: [40]BeltCell = [_]BeltCell{.{}} ** 40,
+    worn: [13]BeltCell = [_]BeltCell{.{}} ** 13,
     /// Fractions of a point the engine keeps (it holds life, mana and stamina << 8), in 1/256, for a
     /// player joined from a `PlayerSpec`: what a cast's 2.5 mana or a frame of regeneration leaves.
     mana_frac: i32 = 0,
@@ -320,6 +326,9 @@ pub const PlayerSpec = struct {
     resist_light: i32 = 0,
     resist_poison: i32 = 0,
     belt: [16]BeltCell = [_]BeltCell{.{}} ** 16,
+    belt_cells: u8 = 4,
+    bag: [40]BeltCell = [_]BeltCell{.{}} ** 40,
+    worn: [13]BeltCell = [_]BeltCell{.{}} ** 13,
     /// Where to stand, in world subtiles; null = the start level's entry point.
     at: ?[2]i32 = null,
 };
@@ -743,6 +752,9 @@ pub const GameInstance = struct {
             .left_skill = spec.left_skill,
             .right_skill = spec.right_skill,
             .belt = spec.belt,
+            .belt_cells = spec.belt_cells,
+            .bag = spec.bag,
+            .worn = spec.worn,
             .outbuf = try self.gpa.alloc(u8, OUT_BUF),
         };
         errdefer self.gpa.free(c.outbuf);
@@ -3186,6 +3198,12 @@ pub const GameInstance = struct {
             return;
         }
 
+        // The Act 1 melee AIs run on the engine's mode clock (see pacedThink).
+        if (!is_pet and self.pacedAi(@intCast(m.class_id))) {
+            self.pacedThink(ls, m, guid, tgt);
+            return;
+        }
+
         // Per-monster AI-script behavior (MonStats.AI) — faithful ports (sim.monai) layered ahead of
         // the generic loop. They add what the baseline lacks: the Fallen scatter, the shaman's revive.
         if (!is_pet) switch (self.aiScript(@intCast(m.class_id))) {
@@ -3358,6 +3376,271 @@ pub const GameInstance = struct {
                     if (res.hit and !res.blocked) sim.combat.applyToLife(t, res.damage);
                 }
             },
+        }
+    }
+
+    // --- The paced melee AIs (D2MOO AiThink.cpp, MonsterMode.cpp) ------------------------------
+    //
+    // The Zombie, Fallen, Brute and FallenShaman AIs act in monster modes. An attack plays its
+    // animation and lands on the animation's hit frame; a hit taken plays get-hit and interrupts
+    // whatever the monster was doing; when a mode ends the next think comes aidel frames later
+    // (the mode-end handler at D2Game.0x6FC64310). A think picks one action by its AI's rules.
+
+    /// sub_6FCF2110: an evil monster's target is the nearest player within aidist (35 when blank).
+    const PACED_AGGRO: i32 = 35;
+    /// How long one walk command heads for the target before the monster thinks again. The engine
+    /// walks a path of a few steps per command; one second of walking stands in for it.
+    const PACED_WALK_FRAMES: u64 = 25;
+    /// sub_6FCD0E80's three circling steps, as a walk towards the target.
+    const PACED_CIRCLE_FRAMES: u64 = 12;
+    /// AITHINK_Fn006_Fallen: a Fallen flees (D2GAME_AICORE_Escape, 12 subtiles) from a monster
+    /// still in its death animation within 15.
+    const FALLEN_FLEE_FROM: i32 = 15;
+    const FALLEN_FLEE_DIST: i32 = 12;
+
+    fn pacedAi(self: *GameInstance, class_id: i32) bool {
+        const mc = self.mon_combat orelse return false;
+        const name = mc.aiName(class_id);
+        for ([_][]const u8{ "Fallen", "FallenShaman", "Zombie", "Brute" }) |n| {
+            if (std.mem.eql(u8, name, n)) return true;
+        }
+        return false;
+    }
+
+    /// AIUTIL_GetDistanceToCoordinates_NoUnitSize: the AI's distance, (min + 2 max) / 2.
+    fn aiDistance(dx: i32, dy: i32) i32 {
+        const ax: i32 = @intCast(@abs(dx));
+        const ay: i32 = @intCast(@abs(dy));
+        return if (ax <= ay) @divTrunc(ax + 2 * ay, 2) else @divTrunc(ay + 2 * ax, 2);
+    }
+
+    fn unitSize(self: *GameInstance, u: *const sim.Unit) i32 {
+        if (u.unit_type == .player) return 2;
+        if (self.mon_combat) |*mc| {
+            if (mc.combat(@intCast(@max(0, u.class_id)))) |row| return row.size_x;
+        }
+        return 2;
+    }
+
+    fn pacedInMelee(self: *GameInstance, m: *const sim.Unit, row: *const sim.montable.MonCombat, t: *const sim.Unit) bool {
+        return sim.monanim.inMeleeRange(t.x - m.x, t.y - m.y, row.size_x, self.unitSize(t), row.melee_rng);
+    }
+
+    fn rollPct(self: *GameInstance, pct: i32) bool {
+        return self.combat_seed.pick(100) < @as(u32, @intCast(std.math.clamp(pct, 0, 100)));
+    }
+
+    /// A monster corpse still in its death animation within `range` of (x, y).
+    fn dyingCorpseWithin(self: *GameInstance, ls: *LevelState, x: i32, y: i32, range: i32) bool {
+        var it = ls.corpses.iterator();
+        while (it.next()) |e| {
+            const cu = ls.units.getPtr(e.key_ptr.*) orelse continue;
+            if (cu.unit_type != .monster) continue;
+            const dt: i32 = if (self.mon_combat) |*mc| (if (mc.combat(@intCast(@max(0, cu.class_id)))) |row| sim.monanim.timing(row.codeStr()).dt else sim.monanim.DEFAULT.dt) else sim.monanim.DEFAULT.dt;
+            if (CORPSE_TTL - e.value_ptr.* >= dt) continue;
+            if (aiDistance(cu.x - x, cu.y - y) < range) return true;
+        }
+        return false;
+    }
+
+    /// AITACTICS_ChangeModeAndTargetUnitToAttack1Or2: attack 1 with the given chance, else attack 2.
+    fn pacedAttack(self: *GameInstance, mm: *sim.levelstate.MonMode, anim: sim.monanim.Timing, a1_pct: i32) void {
+        const now = self.tick_count;
+        const a1 = self.rollPct(a1_pct);
+        mm.kind = .attack;
+        mm.end = now + (if (a1) anim.a1 else anim.a2);
+        mm.hit_at = now + (if (a1) anim.a1_hit else anim.a2_hit);
+    }
+
+    fn pacedMode(self: *GameInstance, mm: *sim.levelstate.MonMode, kind: sim.levelstate.MonMode.Kind, frames: u64) void {
+        mm.kind = kind;
+        mm.end = self.tick_count + frames;
+        mm.hit_at = 0;
+    }
+
+    /// AITACTICS_WalkCloseToUnit(unit, 3): a few steps to a point 3 subtiles off along one axis and
+    /// up to 3 along the other, either way on each.
+    fn pacedWander(self: *GameInstance, mm: *sim.levelstate.MonMode, m: *const sim.Unit) void {
+        const reach: i32 = 3;
+        const rest: i32 = @intCast(self.combat_seed.pick(@intCast(reach)));
+        var ox: i32 = reach;
+        var oy: i32 = rest;
+        if (self.combat_seed.pick(2) == 0) {
+            ox = rest;
+            oy = reach;
+        }
+        if (self.combat_seed.pick(2) == 0) ox = -ox;
+        if (self.combat_seed.pick(2) == 0) oy = -oy;
+        mm.flee_x = m.x + ox;
+        mm.flee_y = m.y + oy;
+        self.pacedMode(mm, .wander, PACED_WALK_FRAMES);
+    }
+
+    fn pacedIdle(self: *GameInstance, mm: *sim.levelstate.MonMode, frames: u64) void {
+        mm.kind = .neutral;
+        mm.next_think = self.tick_count + frames;
+    }
+
+    /// The attack's hit: the monster's A1 attack rating and damage against the player's block.
+    fn pacedStrike(self: *GameInstance, m: *sim.Unit, t: *sim.Unit) void {
+        const atk = sim.combat.monsterAttackFrom(m);
+        const bf: i32 = sim.derive.charStats(.sorceress).block_factor;
+        const res = sim.combat.resolveMonsterAttack(atk, t, &self.combat_seed, bf);
+        if (res.hit and !res.blocked) sim.combat.applyToLife(t, res.damage);
+    }
+
+    fn pacedThink(self: *GameInstance, ls: *LevelState, m: *sim.Unit, guid: u32, tgt_in: ?*sim.Unit) void {
+        const mc = if (self.mon_combat) |*p| p else return;
+        const cls: i32 = @intCast(m.class_id);
+        const row = mc.combat(cls) orelse return;
+        const name = mc.aiName(cls);
+        const anim = sim.monanim.timing(row.codeStr());
+        const diff = @intFromEnum(self.difficulty);
+        const aidel: u64 = @intCast(if (row.ai_delay[diff] > 0) row.ai_delay[diff] else 15);
+        const now = self.tick_count;
+
+        const gop = ls.mon_mode.getOrPut(self.gpa, guid) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const mm = gop.value_ptr;
+
+        // A hit taken: for at least 1/16 of its life (the default hit class's divisor in the get-hit
+        // gate at sub_6FCC1870) it interrupts whatever the monster was doing with get-hit.
+        const life = m.life();
+        if (mm.last_life >= 0 and life < mm.last_life) {
+            mm.aggravated = true;
+            if ((mm.last_life - life) * 16 >= m.get(.maxhp)) self.pacedMode(mm, .gethit, anim.gh);
+        }
+        mm.last_life = life;
+
+        var tgt: ?*sim.Unit = null;
+        var dist: i32 = 0;
+        if (tgt_in) |t| {
+            const d = aiDistance(t.x - m.x, t.y - m.y);
+            if (d <= PACED_AGGRO) {
+                tgt = t;
+                dist = d;
+            }
+        }
+
+        switch (mm.kind) {
+            .neutral => {},
+            .attack => {
+                if (mm.hit_at != 0 and now >= mm.hit_at) {
+                    mm.hit_at = 0;
+                    if (tgt) |t| {
+                        if (self.pacedInMelee(m, row, t)) self.pacedStrike(m, t);
+                    }
+                }
+                if (now >= mm.end) self.pacedIdle(mm, aidel);
+                return;
+            },
+            .taunt, .gethit, .cast => {
+                if (now >= mm.end) self.pacedIdle(mm, aidel);
+                return;
+            },
+            .walk => {
+                const t = tgt orelse {
+                    self.pacedIdle(mm, 0);
+                    return;
+                };
+                if (self.pacedInMelee(m, row, t) or now >= mm.end) {
+                    self.pacedIdle(mm, 0);
+                } else {
+                    _ = self.moveUnitToward(ls, m, guid, t.x, t.y, AI_CONFIG.monster_step, false);
+                    return;
+                }
+            },
+            .flee, .wander => {
+                const arrived = self.moveUnitToward(ls, m, guid, mm.flee_x, mm.flee_y, AI_CONFIG.monster_step, false);
+                if (arrived or now >= mm.end) self.pacedIdle(mm, aidel);
+                return;
+            },
+        }
+        if (now < mm.next_think) return;
+
+        // No target: AITACTICS_Idle for 20 frames (sub_6FCCFC00).
+        const t = tgt orelse return self.pacedIdle(mm, 20);
+        const in_melee = self.pacedInMelee(m, row, t);
+
+        if (std.mem.eql(u8, name, "Zombie")) {
+            // AITHINK_Fn003_Zombie: attack in reach; else close in when hit, or within aip2 on an aip1 roll.
+            if (in_melee) return self.pacedAttack(mm, anim, self.aip(cls, 4));
+            if (mm.aggravated or (dist < self.aip(cls, 2) and self.rollPct(self.aip(cls, 1))))
+                return self.pacedMode(mm, .walk, PACED_WALK_FRAMES);
+            return self.pacedWander(mm, m);
+        }
+        if (std.mem.eql(u8, name, "Brute")) {
+            // AITHINK_Fn007_Brute: in reach attack on an aip3 roll, else (circle or) idle 15; out of reach walk.
+            if (in_melee) {
+                if (self.rollPct(self.aip(cls, 3))) return self.pacedAttack(mm, anim, self.aip(cls, 4));
+                return self.pacedIdle(mm, 15);
+            }
+            return self.pacedMode(mm, .walk, PACED_WALK_FRAMES);
+        }
+        if (std.mem.eql(u8, name, "Fallen")) {
+            // AITHINK_Fn006_Fallen.
+            if (self.dyingCorpseWithin(ls, m.x, m.y, FALLEN_FLEE_FROM)) {
+                const dx = m.x - t.x;
+                const dy = m.y - t.y;
+                const len: i32 = @max(1, @as(i32, @intFromFloat(@sqrt(@as(f64, @floatFromInt(dx * dx + dy * dy))))));
+                mm.flee_x = m.x + @divTrunc(dx * FALLEN_FLEE_DIST, len);
+                mm.flee_y = m.y + @divTrunc(dy * FALLEN_FLEE_DIST, len);
+                mm.rally = true;
+                return self.pacedMode(mm, .flee, PACED_WALK_FRAMES * 2);
+            }
+            if (mm.charge) {
+                if (!in_melee) return self.pacedMode(mm, .walk, PACED_WALK_FRAMES);
+                if (!self.rollPct(self.aip(cls, 3))) return self.pacedIdle(mm, 5);
+                return self.pacedAttack(mm, anim, self.aip(cls, 4));
+            }
+            if (dist < 15 and self.rollPct(self.aip(cls, 1))) {
+                // its war cry: it and its pack charge
+                mm.charge = true;
+                return self.pacedMode(mm, .taunt, anim.s2);
+            }
+            if (!in_melee) {
+                if (mm.aggravated or dist <= self.aip(cls, 2)) return self.pacedMode(mm, .walk, PACED_WALK_FRAMES);
+                if (self.rollPct(30)) return self.pacedWander(mm, m);
+                return self.pacedIdle(mm, 10);
+            }
+            if (!mm.rally and !self.rollPct(self.aip(cls, 3))) {
+                if (self.rollPct(30)) return self.pacedMode(mm, .taunt, anim.s2);
+                return self.pacedIdle(mm, 10);
+            }
+            mm.rally = false;
+            return self.pacedAttack(mm, anim, self.aip(cls, 4));
+        }
+        // AITHINK_Fn013_FallenShaman.
+        if (in_melee and self.rollPct(self.aip(cls, 3))) return self.pacedAttack(mm, anim, 100);
+        // its war command: the Fallen around it charge (its minions; a pack spawns within a few
+        // subtiles of its leader)
+        if (self.rollPct(self.aip(cls, 1))) self.commandFallen(ls, guid, 20);
+        const mm2 = ls.mon_mode.getPtr(guid) orelse return; // commandFallen may have grown the map
+        // A revive takes the turn. It changes ls.units, so `m` is not used after one.
+        mm2.* = .{ .kind = .cast, .end = now + anim.s2, .last_life = mm2.last_life, .aggravated = mm2.aggravated };
+        if (self.reviveNearbyCorpse(ls, guid, m.x, m.y, ls.level_id, self.aip(cls, 4), self.aip(cls, 1), true)) return;
+        if (dist < self.aip(cls, 5) and self.rollPct(self.aip(cls, 2)) and self.tryMonsterCast(ls, m, t))
+            return self.pacedMode(mm2, .cast, anim.a2);
+        // sub_6FCD0E80(target, 3): a few circling steps around the target, which close the distance
+        if (self.rollPct(self.aip(cls, 3))) return self.pacedMode(mm2, .walk, PACED_CIRCLE_FRAMES);
+        self.pacedIdle(mm2, 10);
+    }
+
+    /// Give the Fallen within `radius` of the shaman `leader` an attack command.
+    fn commandFallen(self: *GameInstance, ls: *LevelState, leader: u32, radius: i32) void {
+        const mc = if (self.mon_combat) |*p| p else return;
+        const lu = ls.units.getPtr(leader) orelse return;
+        const lx = lu.x;
+        const ly = lu.y;
+        var it = ls.units.iterator();
+        while (it.next()) |e| {
+            const u = e.value_ptr;
+            if (u.unit_type != .monster or !u.isAlive() or u.isPet()) continue;
+            if (!std.mem.eql(u8, mc.aiName(@intCast(@max(0, u.class_id))), "Fallen")) continue;
+            if (aiDistance(u.x - lx, u.y - ly) > radius) continue;
+            const gop = ls.mon_mode.getOrPut(self.gpa, e.key_ptr.*) catch return;
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.charge = true;
         }
     }
 
@@ -3892,12 +4175,50 @@ pub const GameInstance = struct {
     /// not one the game knows.
     pub fn useBelt(self: *GameInstance, c: *Client, cell: u8) bool {
         if (cell >= 16 or c.belt[cell].empty()) return false;
+        if (!self.drink(c, std.mem.sliceTo(&c.belt[cell].code, 0))) return false;
+        var i: usize = cell;
+        while (i + 4 < 16) : (i += 4) c.belt[i] = c.belt[i + 4];
+        c.belt[i] = .{};
+        return true;
+    }
+
+    /// Drink the potion in inventory cell `slot` (y * 10 + x), as a right click on it does.
+    pub fn useBag(self: *GameInstance, c: *Client, slot: u8) bool {
+        if (slot >= 40 or c.bag[slot].empty()) return false;
+        if (!self.drink(c, std.mem.sliceTo(&c.bag[slot].code, 0))) return false;
+        c.bag[slot] = .{};
+        return true;
+    }
+
+    /// Shift-click on a potion in the inventory: it goes into the first empty belt cell (by index:
+    /// the bottom row left to right, then the row above). The cell, or -1 when the item is no potion
+    /// or the belt has no room.
+    pub fn bagToBelt(self: *GameInstance, c: *Client, slot: u8) i32 {
+        _ = self;
+        if (slot >= 40 or c.bag[slot].empty()) return -1;
+        const code = std.mem.sliceTo(&c.bag[slot].code, 0);
+        const beltable = std.mem.startsWith(u8, code, "hp") or std.mem.startsWith(u8, code, "mp") or std.mem.startsWith(u8, code, "rv") or
+            std.mem.eql(u8, code, "vps") or std.mem.eql(u8, code, "yps") or std.mem.eql(u8, code, "wms");
+        if (!beltable) return -1;
+        var cell: u8 = 0;
+        while (cell < @min(c.belt_cells, 16)) : (cell += 1) {
+            if (c.belt[cell].empty()) {
+                c.belt[cell] = c.bag[slot];
+                c.bag[slot] = .{};
+                return cell;
+            }
+        }
+        return -1;
+    }
+
+    /// The potion `code`'s Misc.txt effect on the player: false when it is dead or the code is no
+    /// potion the game knows.
+    fn drink(self: *GameInstance, c: *Client, code: []const u8) bool {
         const ls = self.levels.get(c.level_id) orelse return false;
         const u = ls.units.getPtr(c.player_guid) orelse return false;
         if (!u.isAlive()) return false;
         if (self.misc_tbl == null) self.misc_tbl = sim.txt.Table.parse(self.gpa, @import("d2-data").file("Misc")) catch return false;
         const t = &self.misc_tbl.?;
-        const code = std.mem.sliceTo(&c.belt[cell].code, 0);
         const row = t.findByStr("code", code) orelse return false;
         const pct = POTION_PCT[@min(6, u.class_id)];
         const len: i32 = @intCast(t.int(row, "len"));
@@ -3918,9 +4239,6 @@ pub const GameInstance = struct {
                 c.stamina_pot_until = self.tick_count + @as(u64, @intCast(@max(0, len)));
             }
         }
-        var i: usize = cell;
-        while (i + 4 < 16) : (i += 4) c.belt[i] = c.belt[i + 4];
-        c.belt[i] = .{};
         return true;
     }
 
@@ -3990,6 +4308,7 @@ pub const GameInstance = struct {
                 _ = ls.units.remove(guid);
             };
             _ = ls.ai.remove(guid); // a corpse does not think
+            _ = ls.mon_mode.remove(guid);
             _ = ls.targets.remove(guid);
         }
 
@@ -6537,4 +6856,62 @@ test "a level 2 sorceress's Fire Bolt costs 2.5 mana, flies 1.25 subtiles a fram
     try std.testing.expect(hit_frame.? + 4 >= @as(u32, @intCast(@divTrunc(dist * 4, 5))) - 4);
     const dealt = t0.life() - ls.units.getPtr(tg).?.life();
     try std.testing.expect(dealt >= 3 and dealt <= 6);
+}
+
+test "a Fallen in reach swings on the game's clock: an attack animation and aidel between swings" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .level = 2, .max_life = 30000, .max_mana = 37, .skills = &.{.{ .id = 36, .level = 1 }} });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    // One Fallen beside the player, nothing else alive.
+    var keep: ?u32 = null;
+    var it = ls.units.iterator();
+    while (it.next()) |e| {
+        const u = e.value_ptr;
+        if (u.unit_type != .monster) continue;
+        if (keep == null and u.class_id == 19) keep = e.key_ptr.* else u.setLife(0);
+    }
+    gi.sweepDeaths(ls);
+    const fallen = ls.units.getPtr(keep.?).?;
+    fallen.x = me.x + 2;
+    fallen.y = me.y;
+    var swings: u32 = 0;
+    var last = me.life();
+    var f: u32 = 0;
+    while (f < 500) : (f += 1) {
+        gi.tick(&captureSink);
+        g_capture_len = 0;
+        const now = ls.units.getPtr(c.player_guid).?.life();
+        if (now < last) swings += 1;
+        last = now;
+    }
+    // A1 10 + aidel 15 frames at the fastest: at most 20 hits in 500 frames (the old flat cadence of
+    // 8 frames came to 62), and a Fallen next to the player does hit.
+    try std.testing.expect(swings >= 1 and swings <= 20);
+    try std.testing.expect(ls.units.getPtr(keep.?).?.x - me.x <= 3);
+}
+
+test "a bag potion shift-clicked goes into the first free belt cell; one right-clicked is drunk" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    var spec: PlayerSpec = .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .mana = 5, .skills = &.{.{ .id = 36, .level = 1 }}, .belt_cells = 8 };
+    for (0..4) |i| spec.belt[i] = .{ .code = .{ 'h', 'p', '1', 0 } };
+    spec.bag[6] = .{ .code = .{ 'm', 'p', '1', 0 } };
+    spec.bag[7] = .{ .code = .{ 'm', 'p', '1', 0 } };
+    spec.bag[9] = .{ .code = .{ 'i', 's', 'c', 0 } };
+    const c = try gi.addPlayer(-1, spec);
+    try std.testing.expectEqual(@as(i32, 4), gi.bagToBelt(c, 6));
+    try std.testing.expect(c.bag[6].empty());
+    try std.testing.expectEqual(@as(i32, -1), gi.bagToBelt(c, 9)); // a scroll stays in the bag
+    try std.testing.expect(gi.useBag(c, 7));
+    try std.testing.expect(c.bag[7].empty());
+    try std.testing.expect(c.mana_pot.frames > 0);
+    try std.testing.expect(!gi.useBag(c, 8)); // an empty cell
 }

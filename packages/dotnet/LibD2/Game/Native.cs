@@ -143,4 +143,13 @@ internal static class Native
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int d2game_save_items(byte[] bytes, UIntPtr len, [Out] SaveItem[]? outArr, int cap);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int d2game_items(IntPtr game, [Out] SaveItem[]? outArr, int cap);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int d2game_bag_to_belt(IntPtr game, int x, int y);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int d2game_use_bag(IntPtr game, int x, int y);
 }

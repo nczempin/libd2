@@ -92,6 +92,10 @@ int32_t d2game_monsters(const D2Game *game, D2GameMonster *out, int32_t cap);
 int32_t d2game_missiles(const D2Game *game, D2GameMissile *out, int32_t cap);
 int32_t d2game_objects(const D2Game *game, D2GameObject *out, int32_t cap);
 int32_t d2game_belt(const D2Game *game, uint8_t out[64]); /* 16 cells x 4-byte Misc.txt code */
+/* What the player wears (dest 1), its belt (dest 2) and inventory (dest 0, page 1): codes and places. */
+int32_t d2game_items(const D2Game *game, D2GameItem *out, int32_t cap);
+int32_t d2game_bag_to_belt(D2Game *game, int32_t x, int32_t y); /* the belt cell, or -1 */
+int32_t d2game_use_bag(D2Game *game, int32_t x, int32_t y);     /* 1 drunk */
 int32_t d2game_skill_level(const D2Game *game, int32_t skill_id);
 int32_t d2game_monsters_left(D2Game *game, int32_t level_id);
 

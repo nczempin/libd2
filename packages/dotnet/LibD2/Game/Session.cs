@@ -87,6 +87,22 @@ public sealed class Session : IDisposable
         return cells;
     }
 
+    /// <summary>What the player wears (Dest 1), its belt (Dest 2) and its inventory (Dest 0, Page 1):
+    /// codes and places only.</summary>
+    public SaveItem[] Items()
+    {
+        var n = Native.d2game_items(H, null, 0);
+        var arr = new SaveItem[Math.Max(0, n)];
+        if (n > 0) Native.d2game_items(H, arr, n);
+        return arr;
+    }
+
+    /// <summary>Shift-click the potion in inventory cell (x, y) into the belt: the belt cell, or -1.</summary>
+    public int BagToBelt(int x, int y) => Native.d2game_bag_to_belt(H, x, y);
+
+    /// <summary>Drink the potion in inventory cell (x, y), as a right click on it does.</summary>
+    public bool UseBag(int x, int y) => Native.d2game_use_bag(H, x, y) == 1;
+
     public int SkillLevel(int skillId) => Native.d2game_skill_level(H, skillId);
 
     /// <summary>The items of a .d2s (1.14d or D2R).</summary>

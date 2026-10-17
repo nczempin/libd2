@@ -124,6 +124,18 @@ const STAT_ITEM_TABSKILLS: u16 = 188; // param = class * 8 + tab (class tabs of 
 
 /// The character a `.d2s` describes, as a PlayerSpec. `skills` is filled into `out_skills`, which
 /// the spec borrows.
+/// Belts.txt numboxes for the belt `code`: Armor.txt's belt column is the Belts.txt row.
+fn beltBoxes(gpa: std.mem.Allocator, code: []const u8) !u8 {
+    var armor = try sim.txt.Table.parse(gpa, d2data.file("Armor"));
+    defer armor.deinit();
+    var belts = try sim.txt.Table.parse(gpa, d2data.file("Belts"));
+    defer belts.deinit();
+    const row = armor.findByStr("code", code) orelse return 4;
+    const idx = armor.int(row, "belt");
+    if (idx < 0 or idx >= belts.rowCount()) return 4;
+    return @intCast(std.math.clamp(belts.int(@intCast(idx), "numboxes"), 4, 16));
+}
+
 fn specFromSave(gpa: std.mem.Allocator, bytes: []const u8, out_skills: *std.ArrayListUnmanaged(gs.PlayerSpec.SkillLevel), name_buf: *[16]u8) !gs.PlayerSpec {
     const s = try save.parse(bytes);
     var spec = gs.PlayerSpec{};
@@ -173,8 +185,15 @@ fn specFromSave(gpa: std.mem.Allocator, bytes: []const u8, out_skills: *std.Arra
     var it = s.items.iterator();
     while (it.next()) |item| {
         const code = item.code[0..@min(item.code_len, 4)];
+        var as_cell = gs.BeltCell{};
+        @memcpy(as_cell.code[0..@min(code.len, 3)], code[0..@min(code.len, 3)]);
         switch (item.dest) {
+            0 => { // stored: page 1 is the inventory grid
+                if (item.page_raw == 1 and item.x < 10 and item.y < 4) spec.bag[@as(usize, item.y) * 10 + item.x] = as_cell;
+            },
             1 => { // equipped
+                if (item.body_loc < spec.worn.len) spec.worn[item.body_loc] = as_cell;
+                if (item.body_loc == 8) spec.belt_cells = try beltBoxes(gpa, code);
                 if (item.body_loc == 4 or item.body_loc == 5) { // right / left hand
                     if (weapons.findByStr("code", code)) |row| {
                         const two = weapons.int(row, "2handmindam");
@@ -489,6 +508,41 @@ export fn d2game_belt(session: ?*const Session, out: ?[*]u8) i32 {
     const o = out orelse return -1;
     for (s.client.belt, 0..) |cell, i| @memcpy(o[i * 4 ..][0..4], &cell.code);
     return 16;
+}
+
+/// What the player carries now, up to `cap`, in the save-item shape: what it wears (dest 1, by
+/// body location), its belt (dest 2, x the cell) and its inventory (dest 0, page 1, x and y the
+/// grid cell). Codes and places only. Returns how many there are.
+export fn d2game_items(session: ?*const Session, out: ?[*]D2GameItem, cap: i32) i32 {
+    const s = session orelse return -1;
+    const c = s.client;
+    var n: i32 = 0;
+    const put = struct {
+        fn f(o: ?[*]D2GameItem, k: *i32, limit: i32, code: [4]u8, dest: i32, body: i32, x: i32, y: i32, page: i32) void {
+            if (o) |p| {
+                if (k.* < limit) p[@intCast(k.*)] = .{ .code = code, .dest = dest, .body_loc = body, .x = x, .y = y, .page = page, .quality = 0, .flags = 0, .n_stats = 0, .bit_len = 0 };
+            }
+            k.* += 1;
+        }
+    }.f;
+    for (c.worn, 0..) |cell, loc| if (!cell.empty()) put(out, &n, cap, cell.code, 1, @intCast(loc), 0, 0, 0);
+    for (c.belt, 0..) |cell, i| if (!cell.empty()) put(out, &n, cap, cell.code, 2, 0, @intCast(i), 0, 0);
+    for (c.bag, 0..) |cell, i| if (!cell.empty()) put(out, &n, cap, cell.code, 0, 0, @intCast(i % 10), @intCast(i / 10), 1);
+    return n;
+}
+
+/// Shift-click the potion in inventory cell (x, y) into the belt: the belt cell it went to, or -1.
+export fn d2game_bag_to_belt(session: ?*Session, x: i32, y: i32) i32 {
+    const s = session orelse return -1;
+    if (x < 0 or x >= 10 or y < 0 or y >= 4) return -1;
+    return s.gi.bagToBelt(s.client, @intCast(y * 10 + x));
+}
+
+/// Drink the potion in inventory cell (x, y), as a right click on it does. 1 drunk, 0 not.
+export fn d2game_use_bag(session: ?*Session, x: i32, y: i32) i32 {
+    const s = session orelse return -1;
+    if (x < 0 or x >= 10 or y < 0 or y >= 4) return 0;
+    return @intFromBool(s.gi.useBag(s.client, @intCast(y * 10 + x)));
 }
 
 /// The player's effective level in a skill (0 = it does not have it).

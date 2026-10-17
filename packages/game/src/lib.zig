@@ -29,6 +29,7 @@ pub const missilespawn = @import("missilespawn.zig");
 pub const select = @import("select.zig");
 pub const ai = @import("ai.zig");
 pub const monai = @import("monai.zig");
+pub const monanim = @import("monanim.zig");
 pub const shrines = @import("shrines.zig");
 pub const effect = @import("effect.zig");
 pub const resolve = @import("resolve.zig");
@@ -118,6 +119,7 @@ test {
     _ = select;
     _ = ai;
     _ = monai;
+    _ = monanim;
     _ = character;
     _ = derive;
     _ = difficulty;

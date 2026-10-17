@@ -58,6 +58,17 @@ pub const MonCombat = struct {
     /// MonStats.spawn resolved to a class id (-1 when blank) — the class a spawner emits (e.g. the
     /// SandMaggotQueen's larva), used when it summons via the spawn column rather than minion1/2.
     spawn: i32 = -1,
+    /// MonStats.Code — the animation token (FA, ZM, ...) its animdata.d2 records start with.
+    code: [4]u8 = .{ 0, 0, 0, 0 },
+    code_len: u8 = 0,
+    /// MonStats2.SizeX and MonStats2.MeleeRng (via MonStats.MonStatsEx): what melee reach and
+    /// the unit distance count with.
+    size_x: i32 = 2,
+    melee_rng: i32 = 0,
+
+    pub fn codeStr(self: *const MonCombat) []const u8 {
+        return self.code[0..self.code_len];
+    }
 };
 
 /// Per-difficulty monster resistances (percent). Physical uses ResDm.
@@ -136,6 +147,22 @@ pub const Tables = struct {
             }
         }
 
+        // MonStats2 size and melee reach, keyed by MonStats2.Id (what MonStatsEx points at). The
+        // map keys borrow the table's strings, which stay alive until the end of load.
+        var m2t = try txt.Table.parse(gpa, d2data.file("MonStats2"));
+        defer m2t.deinit();
+        const Stat2 = struct { size_x: i32, melee_rng: i32 };
+        var ex_to_stat2 = std.StringHashMap(Stat2).init(gpa);
+        defer ex_to_stat2.deinit();
+        {
+            var r: usize = 0;
+            while (r < m2t.rowCount()) : (r += 1) {
+                const ex_id = m2t.str(r, "Id");
+                if (ex_id.len == 0) continue;
+                try ex_to_stat2.put(ex_id, .{ .size_x = @intCast(m2t.int(r, "SizeX")), .melee_rng = @intCast(m2t.int(r, "MeleeRng")) });
+            }
+        }
+
         const triple = struct {
             fn f(t: *const txt.Table, row: usize, base: []const u8) [3]i32 {
                 var buf: [24]u8 = undefined;
@@ -160,7 +187,16 @@ pub const Tables = struct {
                         ai_params[p] = triple(&mt, r, col);
                     }
                 }
+                const s2 = ex_to_stat2.get(mt.str(r, "MonStatsEx")) orelse Stat2{ .size_x = 2, .melee_rng = 0 };
+                const code_src = mt.str(r, "Code");
+                var code: [4]u8 = .{ 0, 0, 0, 0 };
+                const code_len: u8 = @intCast(@min(code_src.len, 4));
+                @memcpy(code[0..code_len], code_src[0..code_len]);
                 mon[out_i] = .{
+                    .code = code,
+                    .code_len = code_len,
+                    .size_x = s2.size_x,
+                    .melee_rng = s2.melee_rng,
                     .no_ratio = mt.int(r, "noRatio") != 0,
                     .ai_name = try gpa.dupe(u8, mt.str(r, "AI")),
                     .ai_delay = triple(&mt, r, "aidel"),

@@ -36,6 +36,31 @@ pub const MoveClock = struct {
     stamina_spent: i32 = 0,
 };
 
+/// What a monster is doing, as the engine's monster modes pace it: an attack, a taunt or a get-hit
+/// plays until `end`; an attack lands on `hit_at`. In neutral mode it thinks again at `next_think`,
+/// `aidel` frames after its last mode ended (or later, after an idle). `last_life` is how much life
+/// it had the frame before, for telling a hit taken. A walk heads for the target until `end` or
+/// until it is in reach; a fleeing Fallen, or a wandering monster, heads for (flee_x, flee_y)
+/// until `end`.
+pub const MonMode = struct {
+    pub const Kind = enum { neutral, attack, taunt, gethit, cast, walk, flee, wander };
+    kind: Kind = .neutral,
+    end: u64 = 0,
+    /// 0 when the attack has landed (or the mode has no hit)
+    hit_at: u64 = 0,
+    next_think: u64 = 0,
+    last_life: i32 = -1,
+    flee_x: i32 = 0,
+    flee_y: i32 = 0,
+    /// An attack command from its own taunt or its shaman (AIGENERAL_AllocCommandsForMinions):
+    /// it walks to the target and attacks without the approach-distance test.
+    charge: bool = false,
+    /// After a flee the next attack is not rolled for (the Fallen AI's dwAiParam[0]).
+    rally: bool = false,
+    /// Hit by its target: it closes in whatever the distance (the AI state 19 a hit sets).
+    aggravated: bool = false,
+};
+
 pub const GroundItem = struct {
     guid: u32,
     x: i32,
@@ -133,6 +158,8 @@ pub const LevelState = struct {
     targets: std.AutoHashMapUnmanaged(u32, MoveTarget) = .empty,
     /// Per-unit movement clocks (see `MoveClock`).
     move_clock: std.AutoHashMapUnmanaged(u32, MoveClock) = .empty,
+    /// Per-monster mode and AI-think clock (see `MonMode`).
+    mon_mode: std.AutoHashMapUnmanaged(u32, MonMode) = .empty,
     moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
     ai: std.AutoHashMapUnmanaged(u32, MonsterAI) = .empty,
     /// Per-unit fractional life-regen accumulator (<<8): the engine keeps hitpoints in
@@ -218,6 +245,7 @@ pub const LevelState = struct {
         self.units.deinit(gpa);
         self.targets.deinit(gpa);
         self.move_clock.deinit(gpa);
+        self.mon_mode.deinit(gpa);
         self.moved.deinit(gpa);
         self.ai.deinit(gpa);
         self.regen_acc.deinit(gpa);
