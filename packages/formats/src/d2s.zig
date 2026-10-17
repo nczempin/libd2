@@ -117,9 +117,54 @@ fn wr16(b: []u8, off: usize, v: u16) void {
     std.mem.writeInt(u16, b[off..][0..2], v, .little);
 }
 
-/// Decode the header from the front of a `.d2s`. Null when the buffer is shorter than the
-/// header. Does NOT check the signature — use `validate` for that.
+/// D2R's current save layout (version 105): the header grows to 403 bytes, the name moves from
+/// 0x14 to 0x12b, and the fields behind the old name slot sit 16 bytes earlier (class 0x18, level
+/// 0x1b, the hand skills 0x68/0x6c, the hotkeys 0x28). Read, never written: `writeHeader` keeps the
+/// 1.14d layout.
+pub const version_d2r_105: u32 = 105;
+pub const header_size_105: usize = 403;
+const off_name_105 = 0x12b;
+const shift_105 = 0x10;
+
+/// Where a save's header ends and its sections begin, by the version it declares.
+pub fn headerSize(data: []const u8) usize {
+    if (data.len >= 8 and rd32(data, off_version) >= version_d2r_105) return header_size_105;
+    return header_size;
+}
+
+fn parseHeader105(data: []const u8) ?Header {
+    if (data.len < header_size_105) return null;
+    const s = shift_105;
+    var h = Header{
+        .signature = rd32(data, off_signature),
+        .version = rd32(data, off_version),
+        .file_size = rd32(data, off_filesize),
+        .checksum = rd32(data, off_checksum),
+        .active_weapon = rd32(data, 0x10),
+        .status = data[off_status - s],
+        .progression = data[off_progression - s],
+        .class = data[off_class - s],
+        .const16 = data[off_const16 - s],
+        .max_skills = data[off_maxskills - s],
+        .level = data[off_level - s],
+        .created = rd32(data, off_createtime - s),
+        .last_played = rd32(data, off_time32 - s),
+        .left_skill = rd32(data, 0x78 - s),
+        .right_skill = rd32(data, 0x7c - s),
+        .alt_left_skill = rd32(data, 0x80 - s),
+        .alt_right_skill = rd32(data, 0x84 - s),
+        .map_id = rd32(data, off_mapid - s),
+    };
+    @memcpy(&h.name, data[off_name_105..][0..16]);
+    for (&h.hotkeys, 0..) |*k, i| k.* = rd32(data, off_hotkeys - s + i * 4);
+    @memcpy(&h.difficulty, data[off_difficulty - s ..][0..3]);
+    return h;
+}
+
+/// Decode the header from the front of a `.d2s` (1.14d, or D2R's version 105). Null when the
+/// buffer is shorter than the header. Does NOT check the signature — use `validate` for that.
 pub fn parseHeader(data: []const u8) ?Header {
+    if (data.len >= 8 and rd32(data, off_version) >= version_d2r_105) return parseHeader105(data);
     if (data.len < header_size) return null;
     var h = Header{
         .signature = rd32(data, off_signature),

@@ -223,6 +223,66 @@ pub fn parseSave(r: *BitReader) Item {
     return it;
 }
 
+/// D2R's item codes in a save (format 97 and up): each of the four code characters is a Huffman
+/// code, read bit by bit, rather than a byte.
+const D2R_CODE_HUFFMAN = [_]struct { ch: u8, bits: []const u8 }{
+    .{ .ch = '0', .bits = "11111011" }, .{ .ch = '1', .bits = "1111100" },  .{ .ch = '2', .bits = "001100" },
+    .{ .ch = '3', .bits = "1101101" },  .{ .ch = '4', .bits = "11111010" }, .{ .ch = '5', .bits = "00010110" },
+    .{ .ch = '6', .bits = "1101111" },  .{ .ch = '7', .bits = "01111" },    .{ .ch = '8', .bits = "000100" },
+    .{ .ch = '9', .bits = "01110" },    .{ .ch = ' ', .bits = "10" },       .{ .ch = 'a', .bits = "11110" },
+    .{ .ch = 'b', .bits = "0101" },     .{ .ch = 'c', .bits = "01000" },    .{ .ch = 'd', .bits = "110001" },
+    .{ .ch = 'e', .bits = "110000" },   .{ .ch = 'f', .bits = "010011" },   .{ .ch = 'g', .bits = "11010" },
+    .{ .ch = 'h', .bits = "00011" },    .{ .ch = 'i', .bits = "1111110" },  .{ .ch = 'j', .bits = "000101110" },
+    .{ .ch = 'k', .bits = "010010" },   .{ .ch = 'l', .bits = "11101" },    .{ .ch = 'm', .bits = "01101" },
+    .{ .ch = 'n', .bits = "001101" },   .{ .ch = 'o', .bits = "1111111" },  .{ .ch = 'p', .bits = "11001" },
+    .{ .ch = 'q', .bits = "11011001" }, .{ .ch = 'r', .bits = "11100" },    .{ .ch = 's', .bits = "0010" },
+    .{ .ch = 't', .bits = "01100" },    .{ .ch = 'u', .bits = "00001" },    .{ .ch = 'v', .bits = "1101110" },
+    .{ .ch = 'w', .bits = "00000" },    .{ .ch = 'x', .bits = "00111" },    .{ .ch = 'y', .bits = "0001010" },
+    .{ .ch = 'z', .bits = "11011000" },
+};
+
+/// One Huffman-coded code character; 0 when the bits match no code within 9.
+fn readD2RCodeChar(r: *BitReader) u8 {
+    var buf: [9]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        buf[n] = if (r.readBool()) '1' else '0';
+        n += 1;
+        for (D2R_CODE_HUFFMAN) |e| {
+            if (std.mem.eql(u8, e.bits, buf[0..n])) return e.ch;
+        }
+    }
+    return 0;
+}
+
+/// Parse one item of a D2R save (format 97 and up), positioned at its flags. D2R items have no
+/// "JM" prefix, a 3-bit version (5) where 1.14d has 10, and a Huffman-coded item code; the rest of
+/// the record is the 1.14d save form. Items are byte-aligned: the caller rounds up past `bit_len`.
+pub fn parseSaveD2R(r: *BitReader) Item {
+    const start_bit = r.bit_pos;
+    var it = Item{};
+    it.flags = r.read(32);
+    it.compact = it.flags & flag.COMPACT != 0;
+    it.version = @intCast(r.read(3));
+    it.dest = @intCast(r.read(3));
+    it.body_loc = @intCast(r.read(4));
+    it.x = @intCast(r.read(4));
+    it.y = @intCast(r.read(4));
+    it.page_raw = @intCast(r.read(3));
+    if (it.flags & flag.BODYPART == 0) {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) it.code[i] = readD2RCodeChar(r);
+        it.code_len = 4;
+        while (it.code_len > 0 and (it.code[it.code_len - 1] == ' ' or it.code[it.code_len - 1] == 0)) it.code_len -= 1;
+    }
+    parseRest(r, &it, true, true);
+    // A D2R compact item carries one bit more than the 1.14d record after its socket bit: an
+    // Identify scroll is 73 bits, not 72, and its padding then ends where the next item starts.
+    if (it.compact) _ = r.read(1);
+    it.bit_len = @intCast(r.bit_pos - start_bit);
+    return it;
+}
+
 fn parseInner(r: *BitReader, is_save: bool) Item {
     const start_bit = r.bit_pos;
     var it = parseBody(r, is_save);
@@ -251,6 +311,13 @@ fn parseBody(r: *BitReader, is_save: bool) Item {
     it.code_len = 4;
     while (it.code_len > 0 and (it.code[it.code_len - 1] == ' ' or it.code[it.code_len - 1] == 0)) it.code_len -= 1;
 
+    parseRest(r, &it, is_save, false);
+    return it;
+}
+
+/// Everything after an item's code, shared by the 1.14d and the D2R headers: the ear, the socket
+/// count, and for an extended item its seed, level, quality block, base stats and stat lists.
+fn parseRest(r: *BitReader, it: *Item, is_save: bool, d2r: bool) void {
     // An ear has no base code: its class, level and name follow the header.
     if (it.flags & flag.BODYPART != 0) {
         it.ear_class = @intCast(r.read(3));
@@ -265,18 +332,18 @@ fn parseBody(r: *BitReader, is_save: bool) Item {
             }
             if (r.bitsLeft() < 7) break;
         }
-        return it;
+        return;
     }
 
     // The count of items socketed into this one follows the code: one bit on a compact item, three
     // on every other. Compact items (gems, runes, potions, keys) carry nothing else here.
     if (it.compact) {
         if (is_save) it.socketed_count = @intCast(r.read(1));
-        return it;
+        return;
     }
 
     it.crude = it.flags & flag.CRUDE != 0;
-    if (it.crude) return it; // CRUDE: nothing past the item code
+    if (it.crude) return; // CRUDE: nothing past the item code
 
     it.socketed_count = @intCast(r.read(3));
     if (is_save) _ = r.read(32); // seed (save-only; nInitSeed / sSeed.nSeedLow)
@@ -365,13 +432,15 @@ fn parseBody(r: *BitReader, is_save: bool) Item {
         switch (t.cat) {
             .armor => {
                 it.cur_list = list_base;
-                _ = addGeneric(r, &it, 31); // armorclass
-                appendDurability(r, &it);
+                _ = addGeneric(r, it, 31); // armorclass
+                appendDurability(r, it);
+                if (d2r) _ = r.read(1); // D2R: one bit after the durability (see parseSaveD2R)
                 it.cur_list = 0;
             },
             .weapon => {
                 it.cur_list = list_base;
-                appendDurability(r, &it);
+                appendDurability(r, it);
+                if (d2r) _ = r.read(1);
                 it.cur_list = 0;
             },
             .misc => {},
@@ -380,11 +449,11 @@ fn parseBody(r: *BitReader, is_save: bool) Item {
     }
 
     if (it.flags & flag.SOCKETED != 0) {
-        const sb = (isc.get(194) orelse return it).save_bits; // item_numsockets, no bias
+        const sb = (isc.get(194) orelse return).save_bits; // item_numsockets, no bias
         it.sockets = @intCast(r.read(@intCast(sb)));
     }
 
-    if (!ident) return it; // unidentified: stream ends here, no stat list
+    if (!ident) return; // unidentified: stream ends here, no stat list
 
     var list_count: i32 = 0;
     var set_mask: u32 = 0;
@@ -401,11 +470,10 @@ fn parseBody(r: *BitReader, is_save: bool) Item {
             (extended and idx == list_count - 1);
         if (do_list) {
             it.cur_list = if (idx == -1) 0 else if (extended and idx == list_count - 1) list_runeword else @intCast(idx + 1);
-            decodeStatList(r, &it);
+            decodeStatList(r, it);
         }
     }
     it.cur_list = 0;
-    return it;
 }
 
 fn appendDurability(r: *BitReader, it: *Item) void {
@@ -853,4 +921,38 @@ test "compact item yields code + position only" {
     try std.testing.expectEqualStrings("gld", it.codeSlice());
     try std.testing.expect(it.on_ground and it.x == 10 and it.y == 20);
     try std.testing.expectEqual(Quality.invalid, it.quality); // never read
+}
+
+test "parseSaveD2R reads a D2R belt potion: 3-bit version, Huffman code, byte-aligned record" {
+    // A minor healing potion in belt cell 2, as a D2R (format 105) save writes it: flags
+    // (identified | compact | 0x800000), version 5, dest 2 (belt), x 2, then "hp1 " Huffman-coded.
+    var buf = [_]u8{0} ** 16;
+    var w = BitWriter.init(&buf);
+    w.write(0xa20010, 32);
+    w.write(5, 3); // version
+    w.write(2, 3); // dest: belt
+    w.write(0, 4); // body loc
+    w.write(2, 4); // x: belt cell
+    w.write(0, 4); // y
+    w.write(0, 3); // page
+    for ("hp1 ") |ch| {
+        for (D2R_CODE_HUFFMAN) |e| if (e.ch == ch) {
+            for (e.bits) |b| w.write(if (b == '1') 1 else 0, 1);
+        };
+    }
+    w.write(0, 1); // socketed count
+    w.write(0, 1); // the D2R compact bit
+    var r = BitReader.init(&buf);
+    const it = parseSaveD2R(&r);
+    try std.testing.expect(it.compact);
+    try std.testing.expectEqualStrings("hp1", it.codeSlice());
+    try std.testing.expectEqual(@as(u8, 2), it.dest);
+    try std.testing.expectEqual(@as(u16, 2), it.x);
+    try std.testing.expectEqual(@as(u32, 74), it.bit_len); // padded to 80 in the save
+}
+
+test "the D2R item code Huffman table is prefix-free" {
+    for (D2R_CODE_HUFFMAN, 0..) |a, i| for (D2R_CODE_HUFFMAN, 0..) |b, j| {
+        if (i != j) try std.testing.expect(!std.mem.startsWith(u8, b.bits, a.bits));
+    };
 }

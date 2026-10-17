@@ -46,6 +46,7 @@ pub const ParseError = error{
     BadSkillMarker,
     BadItemMarker,
     BufferTooSmall,
+    UnsupportedVersion,
 };
 
 /// "Woo!" — the quest section. `head` is the 6-byte section header (06 00 00 00 2a 01 on every
@@ -97,6 +98,8 @@ pub const Skills = struct {
 /// golem blocks, to EOF.
 pub const Items = struct {
     bytes: []const u8 = &.{},
+    /// D2R's item records (save format 97 and up): no "JM" per item, back to back, byte-aligned.
+    d2r: bool = false,
 
     /// The u16 item count of the player's list.
     pub fn playerCount(self: *const Items) u16 {
@@ -109,7 +112,7 @@ pub const Items = struct {
     /// engine loads it). Records are byte-aligned and start with "JM"; the iterator resyncs to the next marker after
     /// every decode.
     pub fn iterator(self: *const Items) Iterator {
-        return .{ .bytes = self.bytes, .remaining = self.playerCount(), .pos = 4 };
+        return .{ .bytes = self.bytes, .remaining = self.playerCount(), .pos = 4, .d2r = self.d2r };
     }
 
     pub const Iterator = struct {
@@ -117,9 +120,23 @@ pub const Items = struct {
         remaining: u16,
         kids: u8 = 0,
         pos: usize,
+        d2r: bool = false,
 
         pub fn next(self: *Iterator) ?wire.Item {
             if (self.remaining == 0 and self.kids == 0) return null;
+            if (self.d2r) {
+                if (self.pos >= self.bytes.len) return null;
+                var rd = core.bitreader.BitReader.init(self.bytes[self.pos..]);
+                const item = wire.parseSaveD2R(&rd);
+                self.pos += (rd.bit_pos + 7) / 8;
+                if (self.kids > 0) {
+                    self.kids -= 1;
+                } else {
+                    self.remaining -= 1;
+                    if (!item.compact and !item.crude) self.kids = item.socketed_count;
+                }
+                return item;
+            }
             while (self.pos + item_marker.len <= self.bytes.len and
                 !std.mem.eql(u8, self.bytes[self.pos..][0..item_marker.len], item_marker)) : (self.pos += 1)
             {}
@@ -158,6 +175,8 @@ pub const Save = struct {
     /// Emit the whole save into `out`, stamping the file size and fixing the checksum. Returns
     /// the written slice. Byte-exact against the source for an unmodified `parse` result.
     pub fn writeInto(self: *const Save, out: []u8) ParseError![]u8 {
+        // A D2R version-105 save is read, not written: its header is a different layout.
+        if (self.header.version >= d2s.version_d2r_105) return error.UnsupportedVersion;
         const total = self.byteLen();
         if (out.len < total) return error.BufferTooSmall;
 
@@ -208,7 +227,7 @@ pub fn parse(data: []const u8) ParseError!Save {
     s.header = d2s.parseHeader(data) orelse return error.TooShort;
     if (s.header.signature != d2s.signature) return error.BadSignature;
 
-    var p: usize = d2s.header_size;
+    var p: usize = d2s.headerSize(data);
 
     try expectMarker(data, p, quest_marker, error.BadQuestMarker);
     if (p + quest_len > data.len) return error.TooShort;
@@ -238,6 +257,6 @@ pub fn parse(data: []const u8) ParseError!Save {
     p += skill_len;
 
     try expectMarker(data, p, item_marker, error.BadItemMarker);
-    s.items = .{ .bytes = data[p..] };
+    s.items = .{ .bytes = data[p..], .d2r = s.header.version >= 0x61 };
     return s;
 }
