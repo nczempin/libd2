@@ -141,6 +141,10 @@ pub const Spawn = struct {
 pub const WarpTarget = struct {
     dest_level: u16,
     warp_type: u8,
+    /// Where the crossing is, level-local subtiles: the centre of the room holding the warp tile
+    /// (DRLGWARP_InitLevelWarpCoordinates), or for a seam the room-pair bridge.
+    x: i32 = 0,
+    y: i32 = 0,
 };
 
 /// Warp-type graphic for `dest` as recorded in this level's raw Levels.txt Vis/Warp
@@ -185,7 +189,7 @@ pub fn warpTargets(ctx: *realdrlg.Ctx, gpa: std.mem.Allocator, seed: u32, diff: 
         };
         if (dup) continue;
         const wtype: u8 = if (a.kind == .warp) warpTypeFor(ctx, level_id, dest) else 0;
-        try out.append(gpa, .{ .dest_level = dest, .warp_type = wtype });
+        try out.append(gpa, .{ .dest_level = dest, .warp_type = wtype, .x = a.x, .y = a.y });
     }
     return out.toOwnedSlice(gpa);
 }

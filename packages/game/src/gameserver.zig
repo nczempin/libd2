@@ -155,6 +155,12 @@ pub const Client = struct {
     /// is worn by body location (`worn`). Item codes only: what the potions and the belt need.
     bag: [40]BeltCell = [_]BeltCell{.{}} ** 40,
     worn: [13]BeltCell = [_]BeltCell{.{}} ** 13,
+    /// The player's own animation (a cast, a get-hit) holds it until this frame: it does not walk or
+    /// start another action. `pending_cast` is a cast waiting for its release frame; `last_life` tells a
+    /// hit taken.
+    busy_until: u64 = 0,
+    pending_cast: ?GameInstance.PendingCast = null,
+    last_life: i32 = -1,
     /// Fractions of a point the engine keeps (it holds life, mana and stamina << 8), in 1/256, for a
     /// player joined from a `PlayerSpec`: what a cast's 2.5 mana or a frame of regeneration leaves.
     mana_frac: i32 = 0,
@@ -502,15 +508,22 @@ pub const GameInstance = struct {
             }
         }
 
-        // Instantiate outgoing warps near the entry point (real warp coords are a residual;
-        // the destination-level adjacency is faithful — from the Vis/Warp graph).
+        // Instantiate outgoing warps. Each stands on the open ground nearest the centre of the room
+        // holding its warp tile, which stands in for where the engine puts a player who comes
+        // through it (SUNIT_WarpPlayer: a free spot by the tile itself, which the DRLG does not
+        // give). In the Den of Evil that is 7 subtiles from where a live game's player arrives from
+        // the Blood Moor. Without a map, near the entry point as before.
         for (pop.warps, 0..) |wt, i| {
-            const off: i32 = @intCast((i + 1) * 24);
+            var at = [2]i32{ ls.entry_x + @as(i32, @intCast((i + 1) * 24)), ls.entry_y };
+            if (ls.level) |lv| {
+                const w = lv.toWorld(.{ .x = wt.x, .y = wt.y });
+                at = nearestOpen(ls, w.x, w.y, 40) orelse .{ w.x, w.y };
+            }
             try ls.warps.append(self.gpa, .{
                 .guid = self.allocGuid(),
                 .class_id = wt.warp_type,
-                .x = ls.entry_x + off,
-                .y = ls.entry_y,
+                .x = at[0],
+                .y = at[1],
                 .dest_level = wt.dest_level,
             });
         }
@@ -731,8 +744,11 @@ pub const GameInstance = struct {
         var book = sim.skill.SkillBook{};
         for (spec.skills) |s| book.set(s.id, s.level);
 
-        const at_x = if (spec.at) |p| p[0] else start.entry_x;
-        const at_y = if (spec.at) |p| p[1] else start.entry_y;
+        // A game started in a level begins where one arrives in it through its first warp: the Den
+        // of Evil's cave mouth from the Blood Moor. A level without warps: its entry point.
+        const first_warp: ?[2]i32 = if (start.warps.items.len > 0) .{ start.warps.items[0].x, start.warps.items[0].y } else null;
+        const at_x = if (spec.at) |p| p[0] else if (first_warp) |w| w[0] else start.entry_x;
+        const at_y = if (spec.at) |p| p[1] else if (first_warp) |w| w[1] else start.entry_y;
         u.x = at_x;
         u.y = at_y;
         u.collision = sim.unit.Collision.player(PLAYER_SIZE_X);
@@ -886,6 +902,7 @@ pub const GameInstance = struct {
         self.tickBuffs(); // count down each player's timed buffs; expire (remove stats) at 0
         self.tickPoison(); // deal each active poison DoT's per-frame damage; drop it when it runs out
         self.tickCurses(); // count down each enemy's curse; lift the debuff on expiry
+        self.tickPlayerActions(); // proxy players: a cast leaves on its animation's release frame
         self.tickPlayerVitals(); // proxy players: mana/stamina regeneration, potions, death
 
         self.updateClients(writeFn); //     UpdateClients            @0x52d440
@@ -1125,6 +1142,9 @@ pub const GameInstance = struct {
             const guid = e.key_ptr.*;
             const tgt = e.value_ptr.*;
             const u = ls.units.getPtr(guid) orelse continue;
+            if (self.clientFor(guid)) |c| {
+                if (self.tick_count < c.busy_until) continue; // casting or recovering: the walk waits
+            }
             if (self.moveUnitToward(ls, u, guid, tgt.x, tgt.y, MOVE_STEP, true)) reached.append(self.gpa, guid) catch {};
         }
         for (reached.items) |guid| _ = ls.targets.remove(guid);
@@ -1494,9 +1514,11 @@ pub const GameInstance = struct {
         _ = src.moved.remove(c.player_guid);
         src.unsettle(c.player_guid);
 
+        // By the warp back to where it came from (SUNIT_WarpPlayer).
+        const arrive = arrivalFrom(dst, src.level_id);
         var u = removed.value;
-        u.x = dst.entry_x;
-        u.y = dst.entry_y;
+        u.x = arrive[0];
+        u.y = arrive[1];
         if (!u.isAlive()) u.setLife(u.get(.maxhp));
         dst.units.put(self.gpa, c.player_guid, u) catch {
             // Put it back on failure so the player isn't lost.
@@ -1507,8 +1529,8 @@ pub const GameInstance = struct {
         dst.settle(c.player_guid, dst.units.getPtr(c.player_guid).?);
 
         c.level_id = dest_level;
-        c.x = dst.entry_x;
-        c.y = dst.entry_y;
+        c.x = arrive[0];
+        c.y = arrive[1];
         c.last_hp = -1; // force a fresh Life packet
         c.pending_loadact = true;
         _ = c.known.remove(c.player_guid); // re-emit CreatePlayer after LoadAct
@@ -2123,12 +2145,73 @@ pub const GameInstance = struct {
         } else |_| {}
     }
 
-    const CastTarget = struct { x: u16 = 0, y: u16 = 0, guid: u32 = 0 };
+    pub const CastTarget = struct { x: u16 = 0, y: u16 = 0, guid: u32 = 0 };
 
+    /// A cast whose animation has not reached its release frame yet.
+    pub const PendingCast = struct { skill_id: u16, target: CastTarget, release_at: u64 };
+
+    /// A cast by a player joined from a `PlayerSpec` plays the class's cast animation (PLRMODE_CAST):
+    /// mana is paid at once, the skill leaves on the animation's release frame, and until the
+    /// animation ends the player starts nothing else and does not walk; a cast asked for meanwhile is
+    /// dropped. The stock test players cast at once.
     fn castSkill(self: *GameInstance, c: *Client, ls: *LevelState, skill_id: u16, target: CastTarget) void {
+        if (c.book == null) return self.castSkillNow(c, ls, skill_id, target, true);
+        if (self.tick_count < c.busy_until) return;
         const caster = ls.units.getPtr(c.player_guid) orelse return;
         self.ensureSkillTables() catch return;
         if (!caster.isAlive() or !self.payMana(c, caster, skill_id)) return;
+        const t = sim.monanim.playerCast(@intCast(caster.class_id), caster.get(@enumFromInt(105))); // fastercastrate
+        c.busy_until = self.tick_count + t.frames;
+        c.pending_cast = .{ .skill_id = skill_id, .target = target, .release_at = self.tick_count + t.release };
+    }
+
+    /// The open ground (a walking player fits, other units aside) nearest (x, y) in a straight line,
+    /// within `reach` subtiles.
+    fn nearestOpen(ls: *LevelState, x: i32, y: i32, reach: i32) ?[2]i32 {
+        const mask = sim.collision.Colmask.player_path & ~sim.collision.PRESENCE_BITS;
+        var best: ?[2]i32 = null;
+        var bd: i32 = reach * reach + 1;
+        var dy: i32 = -reach;
+        while (dy <= reach) : (dy += 1) {
+            var dx: i32 = -reach;
+            while (dx <= reach) : (dx += 1) {
+                const d = dx * dx + dy * dy;
+                if (d >= bd or !ls.passable(x + dx, y + dy, mask)) continue;
+                bd = d;
+                best = .{ x + dx, y + dy };
+            }
+        }
+        return best;
+    }
+
+    /// Where a player coming from `from_level` arrives in `ls`: by its warp to that level, or the
+    /// level's entry point when there is none.
+    fn arrivalFrom(ls: *const LevelState, from_level: u16) [2]i32 {
+        for (ls.warps.items) |w| if (w.dest_level == from_level) return .{ w.x, w.y };
+        return .{ ls.entry_x, ls.entry_y };
+    }
+
+    /// The client whose player unit is `guid`, if one is.
+    fn clientFor(self: *GameInstance, guid: u32) ?*Client {
+        for (self.clients.items) |c| if (c.player_guid == guid) return c;
+        return null;
+    }
+
+    /// Release a pending cast whose frame has come (see `castSkill`).
+    fn tickPlayerActions(self: *GameInstance) void {
+        for (self.clients.items) |c| {
+            const p = c.pending_cast orelse continue;
+            if (self.tick_count < p.release_at) continue;
+            c.pending_cast = null;
+            const ls = self.levels.get(c.level_id) orelse continue;
+            self.castSkillNow(c, ls, p.skill_id, p.target, false);
+        }
+    }
+
+    fn castSkillNow(self: *GameInstance, c: *Client, ls: *LevelState, skill_id: u16, target: CastTarget, pay: bool) void {
+        const caster = ls.units.getPtr(c.player_guid) orelse return;
+        self.ensureSkillTables() catch return;
+        if (!caster.isAlive() or (pay and !self.payMana(c, caster, skill_id))) return;
 
         // Teleport (DOFUNC_TELEPORT): a pure host-side reposition. Resolve the destination:
         // entity-targeted casts jump to (near) the target unit, location casts to (x,y). The move
@@ -3503,12 +3586,13 @@ pub const GameInstance = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const mm = gop.value_ptr;
 
-        // A hit taken: for at least 1/16 of its life (the default hit class's divisor in the get-hit
-        // gate at sub_6FCC1870) it interrupts whatever the monster was doing with get-hit.
+        // A hit taken that passes the get-hit gate (sub_6FCC1870, with the default hit class's
+        // divisor 16: Fire Bolt and Charged Bolt have it) interrupts whatever the monster was doing.
         const life = m.life();
         if (mm.last_life >= 0 and life < mm.last_life) {
             mm.aggravated = true;
-            if ((mm.last_life - life) * 16 >= m.get(.maxhp)) self.pacedMode(mm, .gethit, anim.gh);
+            if (sim.monanim.hitRecovers(mm.last_life - life, m.get(.maxhp), 16, self.combat_seed.pick(4)))
+                self.pacedMode(mm, .gethit, anim.gh);
         }
         mm.last_life = life;
 
@@ -4163,6 +4247,16 @@ pub const GameInstance = struct {
                 c.dead = true;
                 continue;
             }
+            // A hit taken that passes the get-hit gate (the default hit class: the Act 1 monsters'
+            // all are) plays hit recovery, which interrupts a cast that has not left yet.
+            const life = u.life();
+            if (c.last_life >= 0 and life < c.last_life and
+                sim.monanim.hitRecovers(c.last_life - life, u.get(.maxhp), 16, self.combat_seed.pick(4)))
+            {
+                c.busy_until = self.tick_count + sim.monanim.playerGetHit(@intCast(u.class_id), u.get(@enumFromInt(99))); // fastergethitrate
+                c.pending_cast = null;
+            }
+            c.last_life = life;
             const cls = sim.derive.charStats(@enumFromInt(@as(u8, @intCast(@min(6, u.class_id)))));
             var mana: i32 = @divTrunc(u.get(.maxmana) * 256, @max(1, cls.mana_regen) * 25);
             mana = @divTrunc(mana * (100 + u.get(.manarecoverybonus)), 100);
@@ -6887,8 +6981,9 @@ test "a level 2 sorceress's Fire Bolt costs 2.5 mana, flies 1.25 subtiles a fram
     var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
     gi.setLevel(8);
     defer gi.deinit();
-    _ = try gi.generateLevel();
-    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{ .{ .id = 36, .level = 1 }, .{ .id = 38, .level = 1 } }, .left_skill = 36, .right_skill = 38 });
+    const gen = try gi.generateLevel();
+    // In the middle of the first room, with monsters in sight (the cave mouth has none).
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{ .{ .id = 36, .level = 1 }, .{ .id = 38, .level = 1 } }, .left_skill = 36, .right_skill = 38, .at = .{ gen.entry_x, gen.entry_y } });
     const ls = gi.levels.get(c.level_id).?;
     const me = ls.units.getPtr(c.player_guid).?;
     var best: ?u32 = null;
@@ -6964,6 +7059,53 @@ test "a Fallen in reach swings on the game's clock: an attack animation and aide
     // 8 frames came to 62), and a Fallen next to the player does hit.
     try std.testing.expect(swings >= 1 and swings <= 20);
     try std.testing.expect(ls.units.getPtr(keep.?).?.x - me.x <= 3);
+}
+
+test "a sorceress casts in 13 frames: the bolt leaves on frame 7, a cast meanwhile is dropped" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .class_id = 1, .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{.{ .id = 36, .level = 1 }}, .right_skill = 36 });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    var cmd: [5]u8 = undefined;
+    cmd[0] = 0x0C; // right skill at a location
+    std.mem.writeInt(u16, cmd[1..3], @intCast(me.x + 10), .little);
+    std.mem.writeInt(u16, cmd[3..5], @intCast(me.y), .little);
+    _ = gi.handleCommand(c, &cmd);
+    try std.testing.expectEqual(@as(i32, 34), me.get(.mana)); // 37 - 2.5
+    _ = gi.handleCommand(c, &cmd); // mid-animation: dropped, no mana
+    try std.testing.expectEqual(@as(i32, 34), me.get(.mana));
+    var released_at: ?u32 = null;
+    var f: u32 = 1;
+    while (f <= 13) : (f += 1) {
+        gi.tick(&captureSink);
+        g_capture_len = 0;
+        if (released_at == null and ls.missiles.items.len > 0) released_at = f;
+    }
+    try std.testing.expectEqual(@as(?u32, 7), released_at);
+    _ = gi.handleCommand(c, &cmd); // the animation is over
+    try std.testing.expect(ls.units.getPtr(c.player_guid).?.get(.mana) <= 32);
+}
+
+test "a game started in the Den of Evil begins at the cave mouth from the Blood Moor" {
+    // A live game on this seed put the player, coming from the Blood Moor, at 7536,5138.
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{.{ .id = 36, .level = 1 }} });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    // The warp tile itself is not known (the DRLG gives its room's centre), so the open ground
+    // nearest that centre stands in for the free spot beside the tile: within 8 subtiles.
+    const dx: i32 = me.x - 7536;
+    const dy: i32 = me.y - 5138;
+    try std.testing.expect(dx * dx + dy * dy <= 64);
+    try std.testing.expect(ls.warps.items.len == 1 and ls.warps.items[0].dest_level == 2);
 }
 
 test "a bag potion shift-clicked goes into the first free belt cell; one right-clicked is drunk" {

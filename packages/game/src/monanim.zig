@@ -48,6 +48,61 @@ pub fn timing(code: []const u8) Timing {
     return DEFAULT;
 }
 
+/// A player class's cast and get-hit animations (animdata.d2 <class>SCHTH and <class>GHHTH: frames
+/// per direction, the cast's release frame and animation rate), by class id.
+const PlayerAnim = struct { sc: u16, sc_release: u16, sc_rate: u16, gh: u16 };
+const PLAYER_ANIM = [7]PlayerAnim{
+    .{ .sc = 20, .sc_release = 11, .sc_rate = 256, .gh = 6 }, // Amazon
+    .{ .sc = 14, .sc_release = 7, .sc_rate = 256, .gh = 8 }, // Sorceress
+    .{ .sc = 16, .sc_release = 8, .sc_rate = 256, .gh = 7 }, // Necromancer
+    .{ .sc = 16, .sc_release = 9, .sc_rate = 256, .gh = 5 }, // Paladin
+    .{ .sc = 14, .sc_release = 9, .sc_rate = 256, .gh = 5 }, // Barbarian
+    .{ .sc = 15, .sc_release = 8, .sc_rate = 208, .gh = 7 }, // Druid
+    .{ .sc = 17, .sc_release = 9, .sc_rate = 256, .gh = 5 }, // Assassin
+};
+
+/// The diminishing return on faster cast / hit recovery: 120 x / (120 + x).
+fn effective(x: i32) i32 {
+    if (x <= 0) return 0;
+    return @divTrunc(120 * x, 120 + x);
+}
+
+fn ceilDiv(a: i32, b: i32) i32 {
+    return @divTrunc(a + b - 1, b);
+}
+
+pub const CastTiming = struct { frames: u64, release: u64 };
+
+/// A cast's length and its release frame in game frames: ceil(256 frames / speed) - 1, the speed the
+/// animation rate times (100 + effective FCR) / 100. A sorceress at 0% casts in 13 frames, at 9% in 12.
+pub fn playerCast(class_id: i32, fcr: i32) CastTiming {
+    const a = PLAYER_ANIM[@intCast(std.math.clamp(class_id, 0, 6))];
+    const speed: i32 = @max(1, @divTrunc(@as(i32, a.sc_rate) * (100 + effective(fcr)), 100));
+    return .{
+        .frames = @intCast(@max(1, ceilDiv(256 * @as(i32, a.sc), speed) - 1)),
+        .release = @intCast(@divTrunc(256 * @as(i32, a.sc_release), speed)),
+    };
+}
+
+/// Hit recovery in game frames: get-hit runs at half rate, so ceil(256 frames / speed) - 1 with
+/// speed 256 (50 + effective FHR) / 100. A sorceress at 0% recovers in 15 frames, at 5% in 14.
+pub fn playerGetHit(class_id: i32, fhr: i32) u64 {
+    const a = PLAYER_ANIM[@intCast(std.math.clamp(class_id, 0, 6))];
+    const speed: i32 = @divTrunc(256 * (50 + effective(fhr)), 100);
+    return @intCast(@max(1, ceilDiv(256 * @as(i32, a.gh), speed) - 1));
+}
+
+/// The get-hit gate (sub_6FCC1870) for `lost` life of `maxhp`, with the attack's hit-class divisor
+/// (16 for most): under maxhp / d never, under 2 maxhp / d half the time, under 4 maxhp / d three
+/// times in four, above it always. `roll` is a random number; under one point of life never.
+pub fn hitRecovers(lost: i32, maxhp: i32, divisor: i32, roll: u32) bool {
+    if (lost < 1) return false;
+    if (lost < @divTrunc(maxhp, divisor)) return false;
+    if (lost < @divTrunc(maxhp, @divTrunc(divisor, 2))) return roll & 1 != 0;
+    if (lost < @divTrunc(maxhp, @divTrunc(divisor, 4))) return roll & 3 != 0;
+    return true;
+}
+
 /// D2Common_10399: the distance between two units' edges, from the subtile deltas and the units'
 /// SizeX (a player is 2). Near units read a lookup table; far or big ones a chamfer distance.
 pub fn unitDistance(dx_in: i32, dy_in: i32, size1: i32, size2: i32) i32 {
@@ -92,6 +147,26 @@ test "a Fallen reaches the player about three subtiles away" {
     try std.testing.expect(!inMeleeRange(3, 3, 2, 2, 0));
     // a size-3 Gargantuan Beast reaches one subtile farther
     try std.testing.expect(inMeleeRange(4, 0, 3, 2, 0));
+}
+
+test "player cast and hit recovery frames match the class breakpoints" {
+    // 0% FCR: Amazon 19, Sorceress 13, Necromancer 15, Paladin 15, Barbarian 13, Druid 18, Assassin 16
+    const want = [_]u64{ 19, 13, 15, 15, 13, 18, 16 };
+    for (want, 0..) |f, cls| try std.testing.expectEqual(f, playerCast(@intCast(cls), 0).frames);
+    try std.testing.expectEqual(@as(u64, 12), playerCast(1, 9).frames);
+    try std.testing.expectEqual(@as(u64, 7), playerCast(1, 0).release);
+    // 0% FHR: Amazon 11, Sorceress 15, Necromancer 13, Paladin 9, Barbarian 9, Druid 13, Assassin 9
+    const gh = [_]u64{ 11, 15, 13, 9, 9, 13, 9 };
+    for (gh, 0..) |f, cls| try std.testing.expectEqual(f, playerGetHit(@intCast(cls), 0));
+    try std.testing.expectEqual(@as(u64, 14), playerGetHit(1, 5));
+    try std.testing.expectEqual(@as(u64, 13), playerGetHit(1, 9));
+}
+
+test "the get-hit gate's tiers" {
+    try std.testing.expect(!hitRecovers(2, 64, 16, 3)); // under 1/16
+    try std.testing.expect(hitRecovers(5, 64, 16, 1) and !hitRecovers(5, 64, 16, 2)); // 1/16..1/8: odd rolls
+    try std.testing.expect(hitRecovers(9, 64, 16, 1) and !hitRecovers(9, 64, 16, 4)); // 1/8..1/4: rolls not 0 mod 4
+    try std.testing.expect(hitRecovers(16, 64, 16, 0)); // 1/4 and more
 }
 
 test "built-in timings" {
