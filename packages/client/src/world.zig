@@ -86,6 +86,10 @@ pub const Where = enum(u8) {
     cursor = 4,
     dropped = 5, // mid-drop: on the ground as far as anyone else is concerned
     socket = 6,
+    /// In a vendor's store (0x9C action 0x0B, "add to store"): its stock while a trade window is
+    /// open, on the store page at (x,y). The bit-stream's dest reads "stored" for these, as for
+    /// the character's own bag, so only the action tells them apart.
+    store = 7,
     /// Taken out of the world entirely (picked up by someone, removed from a container).
     gone = 0xff,
 
@@ -703,8 +707,8 @@ pub const World = struct {
 
         var r = BitReader.init(body);
         const it = item_mod.parse(&r);
-        const where = Where.from(it.dest);
-        const owner: u32 = if (where.onGround()) 0 else (self.local_player_guid orelse 0);
+        const where: Where = if (op == 0x9c and action == 0x0b) .store else Where.from(it.dest);
+        const owner: u32 = if (where.onGround() or where == .store) 0 else (self.local_player_guid orelse 0);
         self.items.put(guid, .{ .item = it, .where = where, .owner = owner }) catch {};
 
         // Only an item lying in the world is a unit you can walk to and click.
@@ -1264,6 +1268,18 @@ test "an item that is equipped leaves the floor; one on the ground becomes a uni
     w.apply(&picked);
     try std.testing.expectEqual(Where.gone, w.items.get(0x555).?.where);
     try std.testing.expect(w.getUnit(.item, 0x555) == null);
+}
+
+test "a vendor's stock is in its store, not in the player's bag" {
+    var w = World.init(std.testing.allocator);
+    defer w.deinit();
+    w.local_player_guid = 1;
+    // Charsi's first store item from d2host (1.12): 0x9C action 0x0B, guid 8.
+    const pkt = [_]u8{ 0x9c, 0x0b, 0x1c, 0x05, 0x08, 0x00, 0x00, 0x00, 0x10, 0x28, 0x80, 0x00, 0x65, 0x00, 0x00, 0xc4, 0x16, 0x86, 0x07, 0x02, 0xc3, 0x00, 0x0f, 0x0f, 0x33, 0x21, 0x80, 0xff };
+    w.apply(&pkt);
+    const it = w.items.get(8).?;
+    try std.testing.expectEqual(Where.store, it.where);
+    try std.testing.expectEqual(@as(u32, 0), it.owner);
 }
 
 test "coverage counts a handled packet as applied and an unknown one as ignored" {

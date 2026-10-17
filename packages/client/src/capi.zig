@@ -55,7 +55,7 @@ pub const D2ClientUnit = extern struct {
 };
 
 /// Must match `D2ClientItem` in d2client.h. `where` is the model's `Where` (0 stored, 1 equipped,
-/// 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed); `x`/`y` are the grid cell, or the world
+/// 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed, 7 in a vendor's store); `x`/`y` are the grid cell, or the world
 /// position on the ground; `page` is the raw page field (0 in no grid, else page + 1).
 pub const D2ClientItem = extern struct {
     guid: u32,

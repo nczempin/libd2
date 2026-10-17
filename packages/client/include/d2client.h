@@ -33,7 +33,7 @@ typedef struct D2ClientUnit {
 typedef struct D2ClientItem {
     uint32_t guid;
     uint8_t code[4];
-    int32_t where; /* 0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed */
+    int32_t where; /* 0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed, 7 in a vendor's store */
     uint32_t owner;
     int32_t x, y, page, body_loc, quality, quantity;
     uint32_t flags;

@@ -35,7 +35,7 @@ public struct ClientItem
 {
     public uint Guid;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] CodeBytes;
-    /// <summary>0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed.</summary>
+    /// <summary>0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 5 dropped, 6 socketed, 7 in a vendor's store.</summary>
     public int Where;
     public uint Owner;
     /// <summary>The grid cell, or the world position on the ground.</summary>
