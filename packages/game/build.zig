@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const item = b.dependency("d2_item", .{ .target = target, .optimize = optimize });
     const wworld = b.dependency("d2_world", .{ .target = target, .optimize = optimize });
     const pathfinding = b.dependency("d2_pathfinding", .{ .target = target, .optimize = optimize });
+    const dsave = b.dependency("d2_save", .{ .target = target, .optimize = optimize });
 
     // Library module: the faithful D2 1.14d runtime game-simulation port.
     // Consumers depend on this via `.d2_game = .{ .path = "../game" }`.
@@ -68,4 +69,36 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // C-ABI shim (include/d2game.h): one headless game a C/C++/C# host plays like a client.
+    // Static + shared `d2game` libs; its own tests run under `zig build test` too.
+    const capi = b.option(bool, "capi", "Build the C-ABI shim") orelse true;
+    if (capi and !target.result.cpu.arch.isWasm()) {
+        const deps = .{
+            .{ "d2-core", core.module("d2-core") },
+            .{ "d2-data", data.module("d2-data") },
+            .{ "d2-net", net.module("d2-net") },
+            .{ "d2-drlg", drlg.module("d2-drlg") },
+            .{ "d2-item", item.module("d2-item") },
+            .{ "d2-world", wworld.module("d2-world") },
+            .{ "d2-pathfinding", pathfinding.module("d2-pathfinding") },
+            .{ "d2-save", dsave.module("d2-save") },
+        };
+        const static_mod = b.createModule(.{ .root_source_file = b.path("src/capi.zig"), .target = target, .optimize = optimize });
+        static_mod.pic = true;
+        const shared_mod = b.createModule(.{ .root_source_file = b.path("src/capi.zig"), .target = target, .optimize = optimize });
+        const capi_test_mod = b.createModule(.{ .root_source_file = b.path("src/capi.zig"), .target = target, .optimize = optimize });
+        inline for (deps) |d| {
+            static_mod.addImport(d[0], d[1]);
+            shared_mod.addImport(d[0], d[1]);
+            capi_test_mod.addImport(d[0], d[1]);
+        }
+        const static_lib = b.addLibrary(.{ .name = "d2game", .linkage = .static, .root_module = static_mod });
+        const shared_lib = b.addLibrary(.{ .name = "d2game", .linkage = .dynamic, .root_module = shared_mod });
+        b.installArtifact(static_lib);
+        b.installArtifact(shared_lib);
+        b.installFile("include/d2game.h", "include/d2game.h");
+        const capi_tests = b.addTest(.{ .root_module = capi_test_mod });
+        test_step.dependOn(&b.addRunArtifact(capi_tests).step);
+    }
 }
