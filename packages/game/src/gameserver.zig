@@ -1442,6 +1442,12 @@ pub const GameInstance = struct {
                 const cmd = cs.SelectSkill.decode(buf) catch return n;
                 if (cmd.left) c.left_skill = cmd.skill_id else c.right_skill = cmd.skill_id;
             },
+            .alloc_stat_point => {
+                if (buf.len >= 2) _ = self.allocStat(c, buf[1]);
+            },
+            .alloc_skill_point => {
+                if (buf.len >= 3) _ = self.allocSkill(c, std.mem.readInt(u16, buf[1..3], .little));
+            },
             .left_skill_on_entity, .right_skill_on_entity => {
                 const cmd = cs.LeftSkillOnEntity.decode(buf) catch return n;
                 const skill_id = if (op == .left_skill_on_entity) c.left_skill else c.right_skill;
@@ -4300,6 +4306,63 @@ pub const GameInstance = struct {
         return true;
     }
 
+    /// C->S 0x3A: one unspent attribute point into strength (0), energy (1), dexterity (2) or
+    /// vitality (3), with what it brings: CharStats LifePerVitality and StaminaPerVitality per point
+    /// of vitality, ManaPerMagic per point of energy (in quarters, as the engine counts them).
+    pub fn allocStat(self: *GameInstance, c: *Client, stat_id: u8) bool {
+        if (c.book == null or stat_id > 3) return false;
+        const ls = self.levels.get(c.level_id) orelse return false;
+        const u = ls.units.getPtr(c.player_guid) orelse return false;
+        if (u.get(.statpts) <= 0 or !u.isAlive()) return false;
+        const st: sim.stat.Stat = @enumFromInt(stat_id);
+        const before = u.get(st);
+        u.set(st, before + 1);
+        u.set(.statpts, u.get(.statpts) - 1);
+        const cls = sim.derive.charStats(@enumFromInt(@as(u8, @intCast(@min(6, u.class_id)))));
+        const gain = struct {
+            fn f(per: i32, from: i32) i32 {
+                return @divTrunc(per * (from + 1), 4) - @divTrunc(per * from, 4);
+            }
+        }.f;
+        if (st == .vitality) {
+            const life = gain(cls.life_per_vitality, before);
+            u.set(.maxhp, u.get(.maxhp) + life);
+            u.setLife(u.life() + life);
+            u.set(.maxstamina, u.get(.maxstamina) + gain(cls.stamina_per_vitality, before));
+        } else if (st == .energy) {
+            const mana = gain(cls.mana_per_magic, before);
+            u.set(.maxmana, u.get(.maxmana) + mana);
+            u.set(.mana, u.get(.mana) + mana);
+        }
+        return true;
+    }
+
+    /// C->S 0x3B: one unspent skill point into `skill_id`, when it is the character's class's,
+    /// its Skills.txt reqlevel is reached and its reqskill1..3 are learned.
+    pub fn allocSkill(self: *GameInstance, c: *Client, skill_id: u16) bool {
+        var book = c.book orelse return false;
+        const ls = self.levels.get(c.level_id) orelse return false;
+        const u = ls.units.getPtr(c.player_guid) orelse return false;
+        if (u.get(.newskills) <= 0 or !u.isAlive()) return false;
+        self.ensureSkillTables() catch return false;
+        const t = &self.skills.?.table;
+        const row = t.findByInt("Id", skill_id) orelse return false;
+        const classes = [_][]const u8{ "ama", "sor", "nec", "pal", "bar", "dru", "ass" };
+        if (u.class_id > 6 or !std.mem.eql(u8, t.get(row, "charclass"), classes[u.class_id])) return false;
+        if ((t.getInt(i32, row, "reqlevel") orelse 0) > u.get(.level)) return false;
+        inline for (.{ "reqskill1", "reqskill2", "reqskill3" }) |col| {
+            const need = t.get(row, col);
+            if (need.len > 0) {
+                const nr = t.findRow("skill", need) orelse return false;
+                if (book.get(t.getInt(u16, nr, "Id") orelse return false) <= 0) return false;
+            }
+        }
+        book.set(skill_id, @intCast(book.get(skill_id) + 1));
+        c.book = book;
+        u.set(.newskills, u.get(.newskills) - 1);
+        return true;
+    }
+
     /// Shift-click on a potion in the inventory: it goes into the first empty belt cell (by index:
     /// the bottom row left to right, then the row above). The cell, or -1 when the item is no potion
     /// or the belt has no room.
@@ -7106,6 +7169,31 @@ test "a game started in the Den of Evil begins at the cave mouth from the Blood 
     const dy: i32 = me.y - 5138;
     try std.testing.expect(dx * dx + dy * dy <= 64);
     try std.testing.expect(ls.warps.items.len == 1 and ls.warps.items[0].dest_level == 2);
+}
+
+test "attribute and skill points go in as the character screen and skill tree spend them" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .class_id = 1, .level = 2, .max_life = 49, .max_mana = 37, .vitality = 10, .energy = 35, .stat_points = 2, .skill_points = 2, .skills = &.{.{ .id = 36, .level = 1 }} });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    // a sorceress: 2 life a point of vitality, 2 mana a point of energy
+    _ = gi.handleCommand(c, &[_]u8{ 0x3A, 3, 0 });
+    try std.testing.expectEqual(@as(i32, 51), me.get(.maxhp));
+    _ = gi.handleCommand(c, &[_]u8{ 0x3A, 1, 0 });
+    try std.testing.expectEqual(@as(i32, 39), me.get(.maxmana));
+    try std.testing.expectEqual(@as(i32, 0), me.get(.statpts));
+    try std.testing.expect(!gi.allocStat(c, 0)); // none left
+    // Frost Nova needs level 6; Charged Bolt and a second Fire Bolt go in
+    try std.testing.expect(!gi.allocSkill(c, 44));
+    _ = gi.handleCommand(c, &[_]u8{ 0x3B, 38, 0 });
+    try std.testing.expectEqual(@as(i32, 1), c.book.?.get(38));
+    try std.testing.expect(gi.allocSkill(c, 36));
+    try std.testing.expectEqual(@as(i32, 2), c.book.?.get(36));
+    try std.testing.expect(!gi.allocSkill(c, 37)); // no points left
 }
 
 test "a bag potion shift-clicked goes into the first free belt cell; one right-clicked is drunk" {

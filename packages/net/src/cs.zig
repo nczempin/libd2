@@ -24,6 +24,8 @@ pub const Op = enum(u8) {
     pick_up_item = 0x16, // D2GSPacketClt0x16_PickUpItem (13)  <- SCMD_0x16 pick/interact-ext
     equip_item = 0x1A, // D2GSPacketClt0x1A ItemToBody (9)   <- equip: item GUID -> body slot @0x54ad90
     unequip_item = 0x1C, // D2GSPacketClt0x1C BodyToInventory (3) <- unequip a body slot @0x54aec0
+    alloc_stat_point = 0x3A, // D2GSPacketClt0x3A_AllocStatPoint (3)  <- one attribute point
+    alloc_skill_point = 0x3B, // D2GSPacketClt0x3B_AllocSkillPoint (3) <- one skill point
     select_skill = 0x3C, // D2GSPacketClt0x3C_SetSkill (9)  <- picks the hand's active skill
     chat_message = 0x15, // D2GSPacketClt0x15_ChatMessage (variable)
     _,
