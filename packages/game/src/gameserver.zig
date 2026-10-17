@@ -4035,18 +4035,34 @@ pub const GameInstance = struct {
             }
         }
         var reached = false;
+        // Where the unit cannot stand (rock, a wall): a move never ends there. A flee or a wander
+        // point can fall inside one, and the straight step below once walked a Fallen into rock.
+        // Terrain only: the units' own presence stamps (a unit's covers the cell beside it) do not count.
+        const open = struct {
+            fn f(l: *LevelState, unit: *const sim.Unit, x: i32, y: i32) bool {
+                return l.level == null or l.passable(x, y, unit.collision.path_mask & ~sim.collision.PRESENCE_BITS);
+            }
+        }.f;
         if (used_path) {
             // The path advanced the unit; snap to the final target when within one step of it so
             // the caller can retire the move.
             const dx = tx - u.x;
             const dy = ty - u.y;
             if (dx * dx + dy * dy <= step * step) {
-                u.x = tx;
-                u.y = ty;
+                if (open(ls, u, tx, ty)) {
+                    u.x = tx;
+                    u.y = ty;
+                }
                 reached = true;
             }
         } else {
-            reached = u.stepToward(tx, ty, step);
+            // No path: one straight step, onto open ground only; blocked, the move is over.
+            var probe = u.*;
+            reached = probe.stepToward(tx, ty, step);
+            if (open(ls, u, probe.x, probe.y)) {
+                u.x = probe.x;
+                u.y = probe.y;
+            } else reached = true;
         }
         ls.settle(guid, u);
         ls.moved.put(self.gpa, guid, {}) catch {};
@@ -5404,38 +5420,93 @@ test "walk sets a target and tick moves the player toward it" {
 
     const c = try gi.addClient(-1, "", "");
     const ls = gi.levels.get(gi.level_id).?;
-    const start_x = ls.units.getPtr(c.player_guid).?.x;
+    const start = ls.units.getPtr(c.player_guid).?.*;
 
+    // Open ground ten subtiles away in one of the eight directions.
+    var goal: ?[2]i32 = null;
+    for ([_][2]i32{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0, -1 }, .{ 1, 1 }, .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 } }) |d| {
+        const gx = start.x + d[0] * 10;
+        const gy = start.y + d[1] * 10;
+        if (goal == null and ls.passable(gx, gy, sim.collision.Colmask.player_path & ~sim.collision.PRESENCE_BITS)) goal = .{ gx, gy };
+    }
     var buf: [8]u8 = undefined;
-    const walk = cs.WalkToLocation{ .x = clampU16(start_x + 1000), .y = clampU16(ls.entry_y) };
+    const walk = cs.WalkToLocation{ .x = clampU16(goal.?[0]), .y = clampU16(goal.?[1]) };
     _ = gi.handleCommand(c, walk.encode(&buf));
     try std.testing.expect(ls.targets.contains(c.player_guid));
 
     // A walking sorceress covers WalkVelocity/16 = 6/16 of a subtile a frame: three frames reach one.
     for (0..3) |_| gi.tick(&sink);
-    const new_x = ls.units.getPtr(c.player_guid).?.x;
-    try std.testing.expect(new_x != start_x);
+    const now = ls.units.getPtr(c.player_guid).?;
+    try std.testing.expect(now.x != start.x or now.y != start.y);
     try std.testing.expect(ls.moved.contains(c.player_guid));
 }
 
 test "a unit moves at its table speed: Velocity/16 subtiles a frame" {
     const gpa = std.testing.allocator;
     var gi = GameInstance.init(gpa, 7, 0x13572468, 0, .normal);
-    gi.setLevel(8);
     defer gi.deinit();
-    _ = try gi.generateLevel();
-    const c = try gi.addPlayer(-1, .{ .level = 2 });
-    const ls = gi.levels.get(c.level_id).?;
-    const me = ls.units.getPtr(c.player_guid).?;
+    // Open floor all the way, so nothing but the speed limits the walk.
+    var lv = try bareLevel(gpa, 200, 40);
+    defer lv.deinit();
+    var ls = LevelState{
+        .level_id = 0,
+        .summary = .{ .level_id = 0, .seed = 0, .difficulty = .normal, .room_count = 0, .tile_count = 0, .collision_cells = 0 },
+        .entry_x = 5,
+        .entry_y = 20,
+        .level = &lv,
+    };
+    defer ls.deinit(gpa);
+    const guid: u32 = 1;
+    var u = sim.Unit.init(.player);
+    u.unit_id = guid;
+    u.class_id = 1; // sorceress
+    u.x = 5;
+    u.y = 20;
+    try ls.units.put(gpa, guid, u);
+    const me = ls.units.getPtr(guid).?;
     const sx = me.x;
     // Walk (CharStats WalkVelocity 6): 160 frames = 60 subtiles; run (RunVelocity 9) the same span = 90.
-    var walked: i32 = 0;
     for (0..160) |_| {
         gi.tick_count += 1;
-        _ = gi.moveUnitToward(ls, me, c.player_guid, sx + 1000, me.y, 99, true);
+        _ = gi.moveUnitToward(&ls, me, guid, sx + 1000, me.y, 99, true);
     }
-    walked = @intCast(@abs(me.x - sx));
+    const walked: i32 = @intCast(@abs(me.x - sx));
     try std.testing.expect(walked >= 55 and walked <= 60);
+}
+
+test "a move towards a point inside rock stops at the rock, never in it" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 0x13572468, 0, .normal);
+    defer gi.deinit();
+    // Open floor with a solid block at x 20..29: a flee or wander point inside it has no path.
+    const w: i32 = 40;
+    var lv = try bareLevel(gpa, w, 40);
+    defer lv.deinit();
+    var yy: i32 = 0;
+    while (yy < 40) : (yy += 1) {
+        var xx: i32 = 20;
+        while (xx < 30) : (xx += 1) lv.cells[@intCast(xx + yy * w)] = pf.Colbit.wall;
+    }
+    var ls = LevelState{
+        .level_id = 0,
+        .summary = .{ .level_id = 0, .seed = 0, .difficulty = .normal, .room_count = 0, .tile_count = 0, .collision_cells = 0 },
+        .entry_x = 5,
+        .entry_y = 20,
+        .level = &lv,
+    };
+    defer ls.deinit(gpa);
+    const guid: u32 = 1;
+    var u = sim.Unit.init(.monster);
+    u.unit_id = guid;
+    u.x = 15;
+    u.y = 20;
+    try ls.units.put(gpa, guid, u);
+    const m = ls.units.getPtr(guid).?;
+    for (0..200) |_| {
+        gi.tick_count += 1;
+        _ = gi.moveUnitToward(&ls, m, guid, 25, 20, 2, false);
+        try std.testing.expect(m.x < 20);
+    }
 }
 
 /// A bare level for tests: `w`x`h` of open floor with nothing on it. Its origin is (0,0), so
