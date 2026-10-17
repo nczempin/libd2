@@ -204,6 +204,48 @@ export fn d2client_abi_version() u32 {
     return 1;
 }
 
+fn packet(comptime n: usize, bytes: [n]u8) [n]u8 {
+    return bytes;
+}
+
+test "the server's step moves the player, and a border reveal leaves it on its level" {
+    const h = d2client_create() orelse return error.OutOfMemory;
+    defer d2client_destroy(h);
+    d2client_set_local_name(h, "Maxine");
+    // 0x03 act 0, area 1; 0x07 town room at tile (1128,1160); 0x59 the player at (5663,5813).
+    var load = [_]u8{0} ** 12;
+    load[0] = 0x03;
+    std.mem.writeInt(u16, load[6..8], 1, .little);
+    d2client_apply(h, &load, load.len);
+    const town = packet(6, .{ 0x07, 0x68, 0x04, 0x88, 0x04, 1 });
+    d2client_apply(h, &town, town.len);
+    var p59 = [_]u8{0} ** 26;
+    p59[0] = 0x59;
+    std.mem.writeInt(u32, p59[1..5], 1, .little);
+    @memcpy(p59[6..12], "Maxine");
+    std.mem.writeInt(u16, p59[22..24], 5663, .little);
+    std.mem.writeInt(u16, p59[24..26], 5813, .little);
+    d2client_apply(h, &p59, p59.len);
+    // The Blood Moor's room across the border is revealed: still in the town.
+    const moor = packet(6, .{ 0x07, 0x58, 0x04, 0x88, 0x04, 2 });
+    d2client_apply(h, &moor, moor.len);
+    var p: D2ClientPlayer = undefined;
+    _ = d2client_player(h, &p);
+    try std.testing.expectEqual(@as(i32, 1), p.level_id);
+    // 0x96 as captured from the 1.12 server: stamina 74, x 5657, y 5813.
+    const step = packet(9, .{ 0x96, 0x4a, 0x80, 0x0c, 0x8b, 0x5a, 0x0b, 0x00, 0x00 });
+    d2client_apply(h, &step, step.len);
+    _ = d2client_player(h, &p);
+    try std.testing.expectEqual(@as(i32, 5657), p.x);
+    try std.testing.expectEqual(@as(i32, 5813), p.y);
+    try std.testing.expectEqual(@as(i32, 74), p.stamina);
+    // A step into the Blood Moor's room (x 5590, tile 1118) takes the player onto level 2.
+    const into = packet(9, .{ 0x96, 0x4a, 0x00, 0xeb, 0x8a, 0x5a, 0x0b, 0x00, 0x00 });
+    d2client_apply(h, &into, into.len);
+    _ = d2client_player(h, &p);
+    try std.testing.expectEqual(@as(i32, 2), p.level_id);
+}
+
 test "a created player is read back with its class and position" {
     const h = d2client_create() orelse return error.OutOfMemory;
     defer d2client_destroy(h);

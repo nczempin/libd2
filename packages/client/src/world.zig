@@ -196,6 +196,11 @@ pub const World = struct {
     // RemoveObject (the standalone's death path) and its last-seen hp% before removal.
     last_removed_monster: ?u32 = null,
 
+    /// Revealed rooms (0x07) by their tile origin (x << 16 | y), with their level. The server
+    /// reveals the rooms of the next level across a border too, so the level we are on is the one
+    /// of the room the local player stands in, not the last one revealed.
+    rooms: std.AutoHashMap(u32, u8) = undefined,
+
     /// The act's activated-waypoint bitfield (0x60).
     waypoint_bits: u32 = 0,
 
@@ -209,6 +214,7 @@ pub const World = struct {
             .items = std.AutoHashMap(u32, OwnedItem).init(gpa),
             .player_stats = std.AutoHashMap(u16, i32).init(gpa),
             .roster = std.AutoHashMap(u32, RosterEntry).init(gpa),
+            .rooms = std.AutoHashMap(u32, u8).init(gpa),
         };
     }
 
@@ -229,6 +235,7 @@ pub const World = struct {
         self.items.deinit();
         self.player_stats.deinit();
         self.roster.deinit();
+        self.rooms.deinit();
         if (self.waypoint_class.len != 0) self.gpa.free(self.waypoint_class);
     }
 
@@ -264,6 +271,36 @@ pub const World = struct {
             n += 1;
         }
         for (stale[0..n]) |key| _ = self.units.remove(key);
+    }
+
+    /// The level of the revealed room holding world subtile (x, y): rooms are 8x8 tiles of 5x5
+    /// subtiles, keyed by their tile origin.
+    pub fn levelAt(self: *const World, x: u16, y: u16) ?u8 {
+        const tx: u32 = x / 5;
+        const ty: u32 = y / 5;
+        var it = self.rooms.iterator();
+        while (it.next()) |e| {
+            const rx = e.key_ptr.* >> 16;
+            const ry = e.key_ptr.* & 0xffff;
+            if (tx >= rx and tx < rx + 8 and ty >= ry and ty < ry + 8) return e.value_ptr.*;
+        }
+        return null;
+    }
+
+    /// Put the current level where the local player stands. Units are re-stamped by the room they
+    /// stand in first, so that crossing a border keeps the monsters seen across it.
+    fn followPlayerLevel(self: *World) void {
+        const g = self.local_player_guid orelse return;
+        const me = self.units.get(unitKey(@intFromEnum(UnitType.player), g)) orelse return;
+        if (me.x == 0 and me.y == 0) return;
+        const level = self.levelAt(me.x, me.y) orelse return;
+        if (level == self.level_id) return;
+        self.level_id = level;
+        var it = self.units.valueIterator();
+        while (it.next()) |u| {
+            if (self.levelAt(u.x, u.y)) |l| u.level = l;
+        }
+        self.dropOtherLevels();
     }
 
     /// Feed one framed S->C packet (starting at the opcode byte). Compressed 0xAE containers
@@ -334,7 +371,7 @@ pub const World = struct {
             0x6b, 0x6c => self.applyMonsterMove(buf, 0x0c, 0x0e), // MonsterBeginCastWalk / CastStationary
             0x6d => self.applyUnitMoveTo(buf), // PATH_MoveUnitToPoint x@5 y@7
             0x95 => self.applyLife(buf, false),
-            0x96 => self.applyLife(buf, false), // same bit-packed shape; also carries stamina
+            0x96 => self.applyLocalMove(buf), // the local player's step: stamina, x, y, deltas
 
             0x9c => self.applyItemAction(buf), // into the world / a container
             0x9d => self.applyItemAction(buf), // out of a container: equip, unequip, socket, swap
@@ -356,6 +393,11 @@ pub const World = struct {
                 self.acknowledged[op] +%= 1;
                 return; // acknowledged, not applied — do not also count it below
             },
+        }
+        // The packets that move the local player can take it onto another level.
+        switch (op) {
+            0x0d, 0x0f, 0x15, 0x18, 0x95, 0x96 => self.followPlayerLevel(),
+            else => {},
         }
         self.applied[op] +%= 1;
     }
@@ -404,6 +446,7 @@ pub const World = struct {
     // CLIENT_AllocAct(nAct, nMapSeed, nAutomap, nArea). No object seed here (D2MOO diverges).
     fn applyLoadAct(self: *World, buf: []const u8) void {
         if (buf.len < 12) return;
+        if (buf[1] != self.act) self.rooms.clearRetainingCapacity(); // another act's rooms mean nothing here
         self.act = buf[1];
         self.map_seed = std.mem.readInt(u32, buf[2..6], .little);
         const was = self.level_id;
@@ -416,9 +459,10 @@ pub const World = struct {
     // 0x07 MapReveal @0045CAB0: [id][nX u16][nY u16][eLevel u8] -> AddRoomData(act, eLevel, x, y).
     fn applyMapReveal(self: *World, buf: []const u8) void {
         if (buf.len < 6) return;
-        const was = self.level_id;
-        self.level_id = buf[5];
-        if (self.level_id != was) self.dropOtherLevels();
+        const rx = std.mem.readInt(u16, buf[1..3], .little);
+        const ry = std.mem.readInt(u16, buf[3..5], .little);
+        self.rooms.put((@as(u32, rx) << 16) | ry, buf[5]) catch {};
+        self.followPlayerLevel();
         if (self.verbose) {
             const x = std.mem.readInt(u16, buf[1..3], .little);
             const y = std.mem.readInt(u16, buf[3..5], .little);
@@ -489,6 +533,19 @@ pub const World = struct {
             self.local_player_guid = guid;
         }
         note("  world: CreatePlayer \"{s}\" guid=0x{x} at ({d},{d})\n", .{ u.nameSlice(), guid, u.x, u.y });
+    }
+
+    // 0x96: the server's step of the local player, 9 bytes, bit-packed like 0x95 but without life
+    // and mana: stamina u15, x u16, y u16, then the signed step deltas (d2-net's PlayerLeave).
+    fn applyLocalMove(self: *World, buf: []const u8) void {
+        const p = packets.PlayerLeave.decode(buf) catch return;
+        self.local_stamina = p.stamina;
+        if (self.local_player_guid) |g| {
+            if (self.units.getPtr(unitKey(@intFromEnum(UnitType.player), g))) |u| {
+                u.x = p.x;
+                u.y = p.y;
+            }
+        }
     }
 
     // 0x18 Life @0045D9B0 / 0x95 PlayerJoin @0045DB20: bit-packed (Fog::BitBuffer, LSB-first).
@@ -613,6 +670,13 @@ pub const World = struct {
         const op = buf[0];
         const action = buf[1];
         const guid = std.mem.readInt(u32, buf[4..8], .little);
+
+        // 5 out of a container, 12 out of a shop, 15 out of the belt (a potion drunk): the record
+        // still names the place it left, so it must not be re-read.
+        if (op == 0x9c and (action == 0x05 or action == 0x0c or action == 0x0f)) {
+            if (self.items.getPtr(guid)) |owned| owned.where = .gone;
+            return;
+        }
 
         if (op == 0x9c and action == 0x01) {
             _ = self.units.remove(unitKey(@intFromEnum(UnitType.item), guid));
