@@ -116,9 +116,15 @@ pub const SkillData = struct {
     /// e.g. Fire Bolt ~2 (flat), Teleport 24 at slvl1 dropping to 15 at slvl10 (lvlmana -1),
     /// Blizzard 23 -> 32, Frozen Orb 25 -> 29. manashift is the fixed-point scale.
     pub fn manaCostAt(self: SkillData, level: i32) i32 {
+        return self.manaCost256At(level) >> 8;
+    }
+
+    /// The same cost in the engine's own unit, 1/256 mana (mana is kept << 8): Fire Bolt's 5 << 7 is
+    /// 640, two and a half points, where `manaCostAt` rounds it down to 2.
+    pub fn manaCost256At(self: SkillData, level: i32) i32 {
         const base: i64 = self.mana + self.lvlmana * (@max(1, level) - 1);
         const shift: u6 = @intCast(self.manashift & 0x1f);
-        return @intCast((base * (@as(i64, 1) << shift)) >> 8);
+        return @intCast(@max(0, base * (@as(i64, 1) << shift)));
     }
 };
 

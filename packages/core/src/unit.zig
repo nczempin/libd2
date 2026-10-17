@@ -221,6 +221,9 @@ pub const Weapon = struct {
 /// summoner's unit_id here instead, which is how targeting/collision tell friend from foe.
 pub const NO_OWNER: u32 = 0xFFFFFFFF;
 
+/// A monster's rank (see `Unit.rank`).
+pub const Rank = enum(u8) { normal = 0, champion = 1, unique = 2, superunique = 3, minion = 4 };
+
 /// Clean-room unit for combat resolution.
 pub const Unit = struct {
     unit_type: UnitType = .monster,
@@ -232,6 +235,9 @@ pub const Unit = struct {
     /// True while a burrowing monster (SandRaider / SandMaggot) is UNDERGROUND: it cannot be targeted
     /// or hit until it surfaces (the server-side stand-in for its invulnerable submerged phase).
     submerged: bool = false,
+    /// A monster's rank: what its kill is worth (a champion 3x, a unique or superunique 5x the
+    /// experience) and how a reader labels it. Players and pets are `.normal`.
+    rank: Rank = .normal,
     /// What this unit writes into the collision grid and what stops it when it moves. The engine
     /// assigns it once, when the unit's path is allocated, and reads it for the rest of the unit's
     /// life — so it belongs on the unit, not recomputed at every collision test.

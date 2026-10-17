@@ -12,12 +12,12 @@
 //! area-of-effect splash, per-frame acceleration (Accel/MaxVel ramp), sub-missiles
 //! (srvmissilea/b/c) and NextHit/NextDelay retargeting are explicit TODOs.
 //!
-//! COORDINATE NOTE: the engine tracks missiles in a fine position space; this slice
-//! works directly in world SUBTILES (the on-wire unit coordinate). Missiles.txt Vel
-//! is used as subtiles/tick and Range is scaled by RANGE_SCALE so a bolt crosses a
-//! room rather than dying after a couple of subtiles — a deliberate slice
-//! approximation of the fine->subtile conversion, kept until the precise position
-//! model lands.
+//! COORDINATE NOTE: positions are world SUBTILES (the on-wire unit coordinate) plus a
+//! carried remainder in 1/16 subtile. Missiles.txt Vel is in the engine's velocity units,
+//! the same ones MonStats Velocity uses: a missile covers Vel/16 subtiles a frame (the
+//! PATH step, (1024 * (Vel << 8)) >> 6 over a 4096 direction in 16.16 coordinates), and
+//! Range is its lifetime in frames. A Fire Bolt (Vel 20, Range 50) flies 1.25 subtiles a
+//! frame for two seconds, about 62 subtiles.
 
 const std = @import("std");
 const rng = @import("rng.zig");
@@ -29,11 +29,12 @@ const d2data = @import("d2-data");
 const Seed = rng.Seed;
 const Unit = unit.Unit;
 
-/// Reach scale applied to Missiles.txt Range (see COORDINATE NOTE).
-pub const RANGE_SCALE: i32 = 16;
-/// Floor on the collision radius (world subtiles) so a slow/point-blank bolt still
-/// connects even if a single tick's step under/over-shoots the target's subtile.
-pub const MIN_COLLIDE: i32 = 12;
+/// Fractions of a subtile in a missile's velocity and carried position (see COORDINATE NOTE).
+pub const VEL_UNITS: i32 = 16;
+/// Collision radius (world subtiles) between a missile's centre and a unit's: a unit's
+/// footprint is one to three subtiles across, and no table speed moves a bolt further
+/// than this in a frame, so it cannot step over a target.
+pub const MIN_COLLIDE: i32 = 2;
 
 /// One Missiles.txt row, reduced to the fields the straight-line bolt reads.
 pub const MissileData = struct {
@@ -154,7 +155,8 @@ pub const Missiles = struct {
     }
 };
 
-/// A live missile in flight. Positions are world subtiles; velocity is subtiles/tick.
+/// A live missile in flight. Positions are world subtiles, with the fraction carried in
+/// `fx`/`fy`; velocity (`vel`, `vx`, `vy`) is in 1/16 subtile a frame; `range_left` is frames.
 /// `owner_id` is the caster's unit id (collisions never hit the owner). `dmg_min/max`
 /// are the whole-damage bounds rolled between on hit (snapshot at cast time).
 pub const Missile = struct {
@@ -163,6 +165,9 @@ pub const Missile = struct {
     owner_id: u32 = 0xFFFFFFFF,
     x: i32 = 0,
     y: i32 = 0,
+    /// The part of a subtile travelled beyond `x`/`y`, in 1/16.
+    fx: i32 = 0,
+    fy: i32 = 0,
     vx: i32 = 0,
     vy: i32 = 0,
     vel: i32 = 0,
@@ -237,8 +242,8 @@ pub const Missile = struct {
             .vel = vel,
             .max_vel = data.max_vel,
             .accel = data.accel,
-            .range_left = @max(1, data.range) * RANGE_SCALE,
-            .collide_radius = @max(MIN_COLLIDE, vel),
+            .range_left = @max(1, data.range),
+            .collide_radius = @max(MIN_COLLIDE, @divTrunc(vel + VEL_UNITS - 1, VEL_UNITS)),
             .collide_type = data.collide_type,
             .collide_kill = data.collide_kill,
             .pierce = data.pierce,
@@ -260,12 +265,16 @@ pub const Missile = struct {
             self.vy = @divTrunc(self.vy * nv, self.vel);
             self.vel = nv;
         }
-        self.x += self.vx;
-        self.y += self.vy;
-        self.range_left -= self.vel;
+        self.fx += self.vx;
+        self.fy += self.vy;
+        self.x += @divTrunc(self.fx, VEL_UNITS);
+        self.y += @divTrunc(self.fy, VEL_UNITS);
+        self.fx = @rem(self.fx, VEL_UNITS);
+        self.fy = @rem(self.fy, VEL_UNITS);
+        self.range_left -= 1;
     }
 
-    /// Distance budget exhausted — the missile fizzles.
+    /// Lifetime (Range frames) used up — the missile fizzles.
     pub fn expired(self: *const Missile) bool {
         return self.range_left <= 0;
     }
@@ -422,7 +431,7 @@ test "stepAll damages a hit target, retires the killer, keeps a piercing/flying 
     try testing.expectEqual(@as(i32, 93), mob.life()); // took 7 from missile 1
     try testing.expectEqual(@as(usize, 1), surviving); // missile 1 retired on kill-collision
     try testing.expectEqual(@as(u32, 2), missiles[0].guid); // survivor compacted to front, stepped
-    try testing.expectEqual(@as(i32, 5), missiles[0].range_left); // 10 - vel 5
+    try testing.expectEqual(@as(i32, 9), missiles[0].range_left); // 10 frames, one spent
 }
 
 test "NextDelay: a lingering missile hits a unit once, then waits out the cooldown" {
@@ -635,8 +644,18 @@ test "create aims velocity toward the target and budgets range" {
     const m = Missile.create(data, 7, 0, 0, 100, 0, 5, 9);
     try testing.expectEqual(@as(i32, 20), m.vx); // straight along +X
     try testing.expectEqual(@as(i32, 0), m.vy);
-    try testing.expectEqual(@as(i32, 50 * RANGE_SCALE), m.range_left);
+    try testing.expectEqual(@as(i32, 50), m.range_left); // Range = frames of life
     try testing.expectEqual(@as(u32, 7), m.owner_id);
+}
+
+test "a Fire Bolt flies Vel/16 subtiles a frame for Range frames" {
+    // firebolt: Vel 20, Range 50 -> 1.25 subtiles a frame for 50 frames = 62 subtiles.
+    const data = MissileData{ .id = 58, .vel = 20, .range = 50, .collide_type = 3, .collide_kill = true };
+    var m = Missile.create(data, 7, 0, 0, 1000, 0, 5, 9);
+    var frames: i32 = 0;
+    while (!m.expired()) : (frames += 1) m.step();
+    try testing.expectEqual(@as(i32, 50), frames);
+    try testing.expectEqual(@as(i32, 62), m.x);
 }
 
 test "zero-length aim defaults to +X (well-formed missile)" {
@@ -657,7 +676,7 @@ test "step travels and eventually expires; canHit respects owner + radius" {
     try testing.expect(!m.canHit(&owner)); // never hits its owner
     var mob = Unit.init(.monster);
     mob.unit_id = 2;
-    mob.x = 5;
+    mob.x = 2;
     mob.y = 0;
     mob.setLife(50);
     try testing.expect(m.canHit(&mob)); // within collide radius
@@ -666,7 +685,7 @@ test "step travels and eventually expires; canHit respects owner + radius" {
     try testing.expect(!m.canHit(&mob));
     mob.submerged = false;
     try testing.expect(m.canHit(&mob));
-    // Travel until the budget (2*RANGE_SCALE=32 subtiles, 20/tick) runs out.
+    // Travel until its two frames of life (Range 2) run out.
     var ticks: usize = 0;
     while (!m.expired() and ticks < 100) : (ticks += 1) m.step();
     try testing.expect(m.expired());

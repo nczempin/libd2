@@ -130,6 +130,9 @@ pub const Spawn = struct {
     /// The game host resolves these to their real MonStats HP + boss flags rather than the
     /// generic density-monster placeholder HP.
     preset: bool = false,
+    /// The monster's rank as the pack expansion knows it (d2-core `Rank`: 0 normal, 2 unique,
+    /// 3 superunique, 4 minion).
+    rank: u8 = 0,
 };
 
 /// One outgoing inter-level adjacency of a level: a destination level reachable from this
@@ -557,6 +560,15 @@ pub const World = struct {
         return .{ 0, 0 };
     }
 
+    /// Experience for killing a monster of `class_id` at monster level `mon_level`: MonStats Exp times
+    /// MonLvl XP%, at this world's difficulty (before the champion/unique multiplier).
+    pub fn monExp(self: *World, class_id: i32, mon_level: i32) i32 {
+        const d: usize = @intFromEnum(self.difficulty);
+        const ms = self.montbl.stat(class_id) orelse return 0;
+        const row = self.montbl.monLvlRow(mon_level) orelse return 0;
+        return @divTrunc(ms.exp[d] * row.xp[d], 100);
+    }
+
     pub fn monDamageRegen(self: *World, class_id: i32) i32 {
         if (self.montbl.stat(class_id)) |ms| return ms.damage_regen;
         return 0;
@@ -977,6 +989,7 @@ fn expandPacks(gpa: std.mem.Allocator, montbl: *const realdrlg.monpop.Tables, lv
                 .count = 1,
                 .unique = unique and g == 0,
                 .preset = sp.preset and g == 0,
+                .rank = if (g != 0) 4 else if (unique and sp.preset) 3 else if (unique) 2 else 0,
             });
             // The party every monster spawned without the minion flag brings along.
             const ms = montbl.stat(class_id) orelse continue;
@@ -989,7 +1002,7 @@ fn expandPacks(gpa: std.mem.Allocator, montbl: *const realdrlg.monpop.Tables, lv
                 const mc = ms.minion[@intCast(idx)];
                 idx = if (idx >= alternate) 0 else idx + 1;
                 const mat = (try place.claim(gpa, at.x + rng.below(7) - 3, at.y + rng.below(7) - 3, 6)) orelse continue;
-                try out.append(gpa, .{ .class_id = mc, .x = mat.x, .y = mat.y, .count = 1, .unique = false });
+                try out.append(gpa, .{ .class_id = mc, .x = mat.x, .y = mat.y, .count = 1, .unique = false, .rank = 4 });
             }
         }
     }

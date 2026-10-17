@@ -149,6 +149,21 @@ pub const Client = struct {
     book: ?sim.skill.SkillBook = null,
     /// The potions in the belt (see `BeltCell`).
     belt: [16]BeltCell = [_]BeltCell{.{}} ** 16,
+    /// Fractions of a point the engine keeps (it holds life, mana and stamina << 8), in 1/256, for a
+    /// player joined from a `PlayerSpec`: what a cast's 2.5 mana or a frame of regeneration leaves.
+    mana_frac: i32 = 0,
+    life_frac: i32 = 0,
+    stamina_frac: i32 = 0,
+    /// A healing / mana potion working: so much a frame (1/256) for so many frames. Drinking another
+    /// of the same kind replaces the rest of the first.
+    heal: PotionEffect = .{},
+    mana_pot: PotionEffect = .{},
+    /// Frame until which a stamina potion's +5000% stamina recovery lasts.
+    stamina_pot_until: u64 = 0,
+    /// Set the frame the player's life reaches 0.
+    dead: bool = false,
+    /// Experience earned by kills this game, and the monsters this player killed (by class id).
+    kills: u32 = 0,
     /// Active timed buffs on this player (Battle Orders / Frozen Armor / Enchant / ...): granted on
     /// cast, ticked down each frame, removed on expiry. Modifies the player unit's StatList.
     buffs: sim.buff.BuffList = .{},
@@ -264,6 +279,12 @@ pub const BeltCell = struct {
     }
 };
 
+/// A potion effect in progress: `per_frame` (1/256 points) for `frames` more frames.
+pub const PotionEffect = struct {
+    per_frame: i32 = 0,
+    frames: i32 = 0,
+};
+
 /// A real character to join with (`GameInstance.addPlayer`), as a host decodes it from a save.
 pub const PlayerSpec = struct {
     pub const SkillLevel = struct { id: u16, level: i16 };
@@ -357,6 +378,8 @@ pub const GameInstance = struct {
     /// Shrines.txt view — the shrine function pool + effects. Loaded lazily at level-gen time
     /// so shrine objects can be assigned their rolled effect.
     shrine_tables: ?sim.shrines.Table = null,
+    /// Misc.txt, for what a drunk potion does (stat1/calc1 over len frames). Loaded on first drink.
+    misc_tbl: ?sim.txt.Table = null,
     tc_set: ?items.TCSet = null,
     drop_seed: items.rng.Seed = .{},
     game_seed: items.rng.Seed = .{}, // per-item roll stream for rollDrop (distinct from the TC-walk drop_seed)
@@ -393,6 +416,7 @@ pub const GameInstance = struct {
     }
 
     pub fn deinit(self: *GameInstance) void {
+        if (self.misc_tbl) |*t| t.deinit();
         for (self.clients.items) |c| c.deinit(self.gpa);
         self.clients.deinit(self.gpa);
         var it = self.levels.valueIterator();
@@ -453,7 +477,8 @@ pub const GameInstance = struct {
 
         for (pop.spawns) |spawn| {
             const guid = self.allocGuid();
-            const u = self.buildMonsterUnit(guid, spawn.class_id, spawn.x, spawn.y, level_id, spawn.unique);
+            var u = self.buildMonsterUnit(guid, spawn.class_id, spawn.x, spawn.y, level_id, spawn.unique);
+            u.rank = @enumFromInt(spawn.rank);
             try ls.units.put(self.gpa, guid, u);
             // A passive-AI unit is a non-combat NPC (town folk / neutral): it's placed at its real DS1
             // preset position, is interactable (opens the NPC menu), and gets NO AI-think or stat-regen
@@ -849,6 +874,7 @@ pub const GameInstance = struct {
         self.tickBuffs(); // count down each player's timed buffs; expire (remove stats) at 0
         self.tickPoison(); // deal each active poison DoT's per-frame damage; drop it when it runs out
         self.tickCurses(); // count down each enemy's curse; lift the debuff on expiry
+        self.tickPlayerVitals(); // proxy players: mana/stamina regeneration, potions, death
 
         self.updateClients(writeFn); //     UpdateClients            @0x52d440
 
@@ -2090,6 +2116,7 @@ pub const GameInstance = struct {
     fn castSkill(self: *GameInstance, c: *Client, ls: *LevelState, skill_id: u16, target: CastTarget) void {
         const caster = ls.units.getPtr(c.player_guid) orelse return;
         self.ensureSkillTables() catch return;
+        if (!caster.isAlive() or !self.payMana(c, caster, skill_id)) return;
 
         // Teleport (DOFUNC_TELEPORT): a pure host-side reposition. Resolve the destination:
         // entity-targeted casts jump to (near) the target unit, location casts to (x,y). The move
@@ -3783,6 +3810,155 @@ pub const GameInstance = struct {
         return 0;
     }
 
+    // --- player vitals: mana, stamina, potions, experience, death -----------------
+    //
+    // For a player joined from a PlayerSpec (Client.book set); the stock build keeps the older model.
+    // The engine holds life, mana and stamina << 8; the Client keeps the 1/256 remainders.
+
+    /// The potion multipliers the engine applies per class, in percent of the potion's own value
+    /// (eD2PlayerClassID order): healing, mana. Not in any table; the 1.10+ engine hard-codes them.
+    const POTION_PCT = [7][2]i32{ .{ 150, 150 }, .{ 100, 200 }, .{ 100, 200 }, .{ 150, 150 }, .{ 200, 50 }, .{ 100, 200 }, .{ 150, 150 } };
+    /// Seconds a player's stamina takes to refill while not running, with no bonus. An approximation:
+    /// the engine's stamina regeneration is not ported yet.
+    const STAMINA_REFILL_SECONDS: i32 = 25;
+
+    /// Pay `skill_id`'s mana (Skills.txt mana/lvlmana/manashift, in 1/256) or refuse the cast. A skill
+    /// the character does not have (level 0, the normal attack aside) is refused too.
+    fn payMana(self: *GameInstance, c: *Client, caster: *sim.Unit, skill_id: u16) bool {
+        const book = c.book orelse return true;
+        if (skill_id == 0 or skill_id == SKILL_TELEPORT) return true;
+        const sk = &(self.skills orelse return true);
+        const lvl = book.get(skill_id);
+        if (lvl <= 0) return false;
+        const sd = sk.byId(skill_id) orelse return true;
+        const cost = sd.manaCost256At(lvl);
+        if (cost <= 0) return true;
+        const have = caster.get(.mana) * 256 + c.mana_frac;
+        if (have < cost) return false;
+        const left = have - cost;
+        caster.set(.mana, @divTrunc(left, 256));
+        c.mana_frac = @mod(left, 256);
+        return true;
+    }
+
+    /// Add `delta` (1/256 points) to a pool `cur_stat` capped by `max_stat`, carrying the remainder.
+    fn addPoints(u: *sim.Unit, cur_stat: sim.Stat, max_stat: sim.Stat, frac: *i32, delta: i32) void {
+        const max = u.get(max_stat) * 256;
+        const cur = if (cur_stat == .hitpoints) u.life() else u.get(cur_stat);
+        var total = cur * 256 + frac.* + delta;
+        if (total > max) total = max;
+        if (total < 0) total = 0;
+        if (cur_stat == .hitpoints) u.setLife(@divTrunc(total, 256)) else u.set(cur_stat, @divTrunc(total, 256));
+        frac.* = if (total >= max) 0 else @mod(total, 256);
+    }
+
+    /// Each frame, for every proxy player: mana regeneration (a full pool in CharStats ManaRegen
+    /// seconds, raised by manarecoverybonus), stamina while not running, the potion working, and
+    /// whether the player has died.
+    fn tickPlayerVitals(self: *GameInstance) void {
+        for (self.clients.items) |c| {
+            if (c.book == null) continue;
+            const ls = self.levels.get(c.level_id) orelse continue;
+            const u = ls.units.getPtr(c.player_guid) orelse continue;
+            if (!u.isAlive()) {
+                c.dead = true;
+                continue;
+            }
+            const cls = sim.derive.charStats(@enumFromInt(@as(u8, @intCast(@min(6, u.class_id)))));
+            var mana: i32 = @divTrunc(u.get(.maxmana) * 256, @max(1, cls.mana_regen) * 25);
+            mana = @divTrunc(mana * (100 + u.get(.manarecoverybonus)), 100);
+            if (c.mana_pot.frames > 0) {
+                mana += c.mana_pot.per_frame;
+                c.mana_pot.frames -= 1;
+            }
+            addPoints(u, .mana, .maxmana, &c.mana_frac, mana);
+            if (c.heal.frames > 0) {
+                addPoints(u, .hitpoints, .maxhp, &c.life_frac, c.heal.per_frame);
+                c.heal.frames -= 1;
+            }
+            const running = if (ls.targets.get(c.player_guid)) |t| t.run else false;
+            if (!running) {
+                var st: i32 = @divTrunc(u.get(.maxstamina) * 256, STAMINA_REFILL_SECONDS * 25);
+                const bonus: i32 = if (self.tick_count < c.stamina_pot_until) 5000 else 0;
+                st = @divTrunc(st * (100 + u.get(.staminarecoverybonus) + bonus), 100);
+                addPoints(u, .stamina, .maxstamina, &c.stamina_frac, st);
+            }
+        }
+    }
+
+    /// Drink the potion in belt cell `cell` (0..3, the row the 1..4 keys drink from; any cell works):
+    /// Misc.txt stat1/calc1 (and stat2/calc2) over `len` frames, times the class multiplier; the
+    /// column then drops one cell. False when the cell is empty, the player is dead or the potion is
+    /// not one the game knows.
+    pub fn useBelt(self: *GameInstance, c: *Client, cell: u8) bool {
+        if (cell >= 16 or c.belt[cell].empty()) return false;
+        const ls = self.levels.get(c.level_id) orelse return false;
+        const u = ls.units.getPtr(c.player_guid) orelse return false;
+        if (!u.isAlive()) return false;
+        if (self.misc_tbl == null) self.misc_tbl = sim.txt.Table.parse(self.gpa, @import("d2-data").file("Misc")) catch return false;
+        const t = &self.misc_tbl.?;
+        const code = std.mem.sliceTo(&c.belt[cell].code, 0);
+        const row = t.findByStr("code", code) orelse return false;
+        const pct = POTION_PCT[@min(6, u.class_id)];
+        const len: i32 = @intCast(t.int(row, "len"));
+        inline for (.{ .{ "stat1", "calc1" }, .{ "stat2", "calc2" } }) |cols| {
+            const stat = t.str(row, cols[0]);
+            const val: i32 = @intCast(t.int(row, cols[1]));
+            if (std.mem.eql(u8, stat, "hpregen")) {
+                const amount = @divTrunc(val * pct[0], 100) * 256;
+                c.heal = .{ .per_frame = @divTrunc(amount, @max(1, len)), .frames = len };
+            } else if (std.mem.eql(u8, stat, "manarecovery")) {
+                const amount = @divTrunc(val * pct[1], 100) * 256;
+                c.mana_pot = .{ .per_frame = @divTrunc(amount, @max(1, len)), .frames = len };
+            } else if (std.mem.eql(u8, stat, "hitpoints")) { // rejuvenation: val percent, at once
+                addPoints(u, .hitpoints, .maxhp, &c.life_frac, @divTrunc(u.get(.maxhp) * val, 100) * 256);
+            } else if (std.mem.eql(u8, stat, "mana")) {
+                addPoints(u, .mana, .maxmana, &c.mana_frac, @divTrunc(u.get(.maxmana) * val, 100) * 256);
+            } else if (std.mem.eql(u8, stat, "staminarecoverybonus")) {
+                c.stamina_pot_until = self.tick_count + @as(u64, @intCast(@max(0, len)));
+            }
+        }
+        var i: usize = cell;
+        while (i + 4 < 16) : (i += 4) c.belt[i] = c.belt[i + 4];
+        c.belt[i] = .{};
+        return true;
+    }
+
+    /// A monster `m` died: every proxy player on its level earns its experience (MonStats Exp times
+    /// MonLvl XP% at its level, 3x for a champion, 5x for a unique or superunique), levelling up
+    /// through Experience.txt with StatPerLevel attribute points, 1 skill point, the CharStats
+    /// life/mana/stamina per level, and full life and mana, as the engine does.
+    fn awardExperience(self: *GameInstance, ls: *LevelState, m: *const sim.Unit) void {
+        if (self.world == null) return;
+        const w = &self.world.?;
+        var exp = w.monExp(@intCast(m.class_id), m.get(.level));
+        exp *= switch (m.rank) {
+            .champion => 3,
+            .unique, .superunique => 5,
+            else => 1,
+        };
+        if (exp <= 0) return;
+        for (self.clients.items) |c| {
+            if (c.book == null or c.level_id != ls.level_id) continue;
+            const u = ls.units.getPtr(c.player_guid) orelse continue;
+            if (!u.isAlive()) continue;
+            c.kills += 1;
+            u.set(.experience, u.get(.experience) + exp);
+            const class: sim.derive.Class = @enumFromInt(@as(u8, @intCast(@min(6, u.class_id))));
+            const cls = sim.derive.charStats(class);
+            while (u.get(.level) < 99 and @as(u32, @intCast(u.get(.experience))) >= sim.derive.experienceFor(class, u.get(.level) + 1)) {
+                u.set(.level, u.get(.level) + 1);
+                u.set(.statpts, u.get(.statpts) + cls.stat_per_level);
+                u.set(.newskills, u.get(.newskills) + 1);
+                u.set(.maxhp, u.get(.maxhp) + @divTrunc(cls.life_per_level, 4));
+                u.set(.maxmana, u.get(.maxmana) + @divTrunc(cls.mana_per_level, 4));
+                u.set(.maxstamina, u.get(.maxstamina) + @divTrunc(cls.stamina_per_level, 4));
+                u.setLife(u.get(.maxhp));
+                u.set(.mana, u.get(.maxmana));
+            }
+        }
+    }
+
     // --- death + loot -------------------------------------------------------
 
     /// How long a corpse lingers before it decays (frames; ~20s at 25fps) — long enough for a
@@ -3802,6 +3978,7 @@ pub const GameInstance = struct {
         }
         for (newly.items) |guid| {
             if (ls.units.getPtr(guid)) |u| {
+                self.awardExperience(ls, u);
                 self.rollMonsterDrops(ls, u.*);
                 // A corpse still marks where it lies so Corpse Explosion / Revive can find it, but
                 // it stops claiming the ground — the living walk over the dead.
@@ -6314,4 +6491,50 @@ test "Den of Evil packs: shamans lead fallen parties, Corpsefire leads five zomb
     try std.testing.expect(fallen >= 2 * shamans and fallen <= 6 * shamans + 6);
     try std.testing.expect(zombies >= 6); // Corpsefire and his five
     try std.testing.expect(beasts >= 2 and beasts <= 6);
+}
+test "a level 2 sorceress's Fire Bolt costs 2.5 mana, flies 1.25 subtiles a frame and hits for 3-6" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{ .{ .id = 36, .level = 1 }, .{ .id = 38, .level = 1 } }, .left_skill = 36, .right_skill = 38 });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    var best: ?u32 = null;
+    var bd: i64 = std.math.maxInt(i64);
+    var it = ls.units.iterator();
+    while (it.next()) |e| {
+        const u = e.value_ptr;
+        if (u.unit_type != .monster or !u.isAlive() or !ls.hasLineOfSight(me.x, me.y, u.x, u.y)) continue;
+        const dx: i64 = u.x - me.x;
+        const dy: i64 = u.y - me.y;
+        if (dx * dx + dy * dy < bd) {
+            bd = dx * dx + dy * dy;
+            best = e.key_ptr.*;
+        }
+    }
+    const tg = best.?;
+    const t0 = ls.units.getPtr(tg).?.*;
+    const dist: i32 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(bd))));
+    var cmd: [5]u8 = undefined;
+    cmd[0] = 0x05;
+    std.mem.writeInt(u16, cmd[1..3], @intCast(t0.x), .little);
+    std.mem.writeInt(u16, cmd[3..5], @intCast(t0.y), .little);
+    _ = gi.handleCommand(c, &cmd);
+    // 37 - 2.5 = 34.5
+    try std.testing.expectEqual(@as(i32, 34), ls.units.getPtr(c.player_guid).?.get(.mana));
+    try std.testing.expectEqual(@as(i32, 128), c.mana_frac);
+    var hit_frame: ?u32 = null;
+    var f: u32 = 0;
+    while (f < 60) : (f += 1) {
+        gi.tick(&captureSink);
+        g_capture_len = 0;
+        if (hit_frame == null and ls.units.getPtr(tg).?.life() < t0.life()) hit_frame = f;
+    }
+    // About dist / 1.25 frames of flight (the target walks towards it meanwhile).
+    try std.testing.expect(hit_frame != null);
+    try std.testing.expect(hit_frame.? + 4 >= @as(u32, @intCast(@divTrunc(dist * 4, 5))) - 4);
+    const dealt = t0.life() - ls.units.getPtr(tg).?.life();
+    try std.testing.expect(dealt >= 3 and dealt <= 6);
 }

@@ -124,6 +124,48 @@ pub fn charStats(class: Class) CharStats {
     return CHAR_STATS[@intFromEnum(class)];
 }
 
+/// Experience.txt: the experience a character needs to reach each level, by class (index = level - 1,
+/// so `[0]` is 0 and `[1]` the 500 that makes a level 2). Read at compile time; the values pass
+/// 2^31 near the top, hence u32 rather than the i32 `ctsv.cellInt` parses.
+pub const EXPERIENCE = buildExperience();
+
+fn buildExperience() [CLASS_NAME.len][99]u32 {
+    @setEvalBranchQuota(400000);
+    const txt = d2data.file("Experience");
+    const hdr = ctsv.header(txt);
+    var cols: [CLASS_NAME.len]usize = undefined;
+    for (CLASS_NAME, 0..) |name, i| cols[i] = ctsv.columnIndex(hdr, name) orelse @compileError("Experience.txt: no column " ++ name);
+    var out: [CLASS_NAME.len][99]u32 = undefined;
+    var lines = std.mem.splitScalar(u8, txt, '\n');
+    _ = lines.first();
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const lvl_s = fields.first();
+        const lvl = std.fmt.parseInt(usize, lvl_s, 10) catch continue; // MaxLvl and blank rows
+        if (lvl >= 99) continue;
+        var cells: [16][]const u8 = undefined;
+        var n: usize = 1;
+        cells[0] = lvl_s;
+        while (fields.next()) |f| : (n += 1) cells[n] = f;
+        for (cols, 0..) |ci, k| out[k][lvl] = std.fmt.parseInt(u32, std.mem.trim(u8, cells[ci], " \r"), 10) catch 0;
+    }
+    return out;
+}
+
+/// The experience a character of `class` needs to reach `level` (1..99); 0 for level 1.
+pub fn experienceFor(class: Class, level: i32) u32 {
+    if (level <= 1) return 0;
+    const i: usize = @intCast(@min(level - 1, 98));
+    return EXPERIENCE[@intFromEnum(class)][i];
+}
+
+test "Experience.txt: level 2 takes 500 experience, level 3 1500" {
+    try testing.expectEqual(@as(u32, 0), experienceFor(.sorceress, 1));
+    try testing.expectEqual(@as(u32, 500), experienceFor(.sorceress, 2));
+    try testing.expectEqual(@as(u32, 1500), experienceFor(.sorceress, 3));
+}
+
 pub const Derived = struct {
     max_life: i32,
     max_mana: i32,

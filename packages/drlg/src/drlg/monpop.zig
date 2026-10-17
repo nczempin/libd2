@@ -113,6 +113,8 @@ pub const MonStat = struct {
     is_boss: bool, // boss — act-boss / mini-boss flag
     is_prime_evil: bool, // primeevil — Mephisto/Diablo/Baal
     is_npc: bool, // npc — town NPC (no combat)
+    /// Exp / Exp(N) / Exp(H): base experience; a kill is worth Exp * MonLvl.XP[level] / 100.
+    exp: [3]i32 = .{ 0, 0, 0 },
 };
 
 /// Per-difficulty monster resistances, percent (i16: 100 = immune, negatives amplify).
@@ -160,6 +162,7 @@ pub const SuperUnique = struct {
 /// scaling — add them when needed). `hp[diff]` is the HP% for Normal/NM/Hell.
 pub const MonLvlRow = struct {
     hp: [3]i32, // HP / HP(N) / HP(H)
+    xp: [3]i32 = .{ 0, 0, 0 }, // XP / XP(N) / XP(H)
 };
 
 pub const Tables = struct {
@@ -278,6 +281,7 @@ pub const Tables = struct {
                     .is_boss = mt.int(r, "boss") != 0,
                     .is_prime_evil = mt.int(r, "primeevil") != 0,
                     .is_npc = mt.int(r, "npc") != 0,
+                    .exp = .{ @intCast(mt.int(r, "Exp")), @intCast(mt.int(r, "Exp(N)")), @intCast(mt.int(r, "Exp(H)")) },
                 };
                 out_i += 1;
             }
@@ -377,6 +381,10 @@ pub const Tables = struct {
                     @intCast(mlt.int(r, "HP")),
                     @intCast(mlt.int(r, "HP(N)")),
                     @intCast(mlt.int(r, "HP(H)")),
+                }, .xp = .{
+                    @intCast(mlt.int(r, "XP")),
+                    @intCast(mlt.int(r, "XP(N)")),
+                    @intCast(mlt.int(r, "XP(H)")),
                 } };
             }
         }
