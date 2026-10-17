@@ -471,6 +471,7 @@ pub const World = struct {
         while (nlen < 16 and raw[nlen] != 0) nlen += 1;
         @memcpy(u.name[0..16], raw);
         u.name_len = nlen;
+        u.class_id = buf[5]; // eD2PlayerClass
         u.x = std.mem.readInt(u16, buf[22..24], .little);
         u.y = std.mem.readInt(u16, buf[24..26], .little);
         // Prefer the character we said we are; latching purely on arrival order would pick a ghost
