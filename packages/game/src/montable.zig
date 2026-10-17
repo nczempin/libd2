@@ -65,6 +65,9 @@ pub const MonCombat = struct {
     /// the unit distance count with.
     size_x: i32 = 2,
     melee_rng: i32 = 0,
+    /// MonStats.TreasureClass1..4 (normal, champion, unique, quest) per difficulty: what the monster
+    /// drops. Owned by Tables; "" when blank.
+    tc: [4][3][]const u8 = .{.{ "", "", "" }} ** 4,
 
     pub fn codeStr(self: *const MonCombat) []const u8 {
         return self.code[0..self.code_len];
@@ -199,6 +202,18 @@ pub const Tables = struct {
                     .melee_rng = s2.melee_rng,
                     .no_ratio = mt.int(r, "noRatio") != 0,
                     .ai_name = try gpa.dupe(u8, mt.str(r, "AI")),
+                    .tc = blk: {
+                        var tc: [4][3][]const u8 = undefined;
+                        for (0..4) |k| {
+                            for (0..3) |d| {
+                                var nb: [32]u8 = undefined;
+                                const suffix = [_][]const u8{ "", "(N)", "(H)" };
+                                const col = std.fmt.bufPrint(&nb, "TreasureClass{d}{s}", .{ k + 1, suffix[d] }) catch unreachable;
+                                tc[k][d] = try gpa.dupe(u8, mt.str(r, col));
+                            }
+                        }
+                        break :blk tc;
+                    },
                     .ai_delay = triple(&mt, r, "aidel"),
                     .ai_params = ai_params,
                     .minion = .{
@@ -256,7 +271,10 @@ pub const Tables = struct {
     }
 
     pub fn deinit(self: *Tables) void {
-        for (self.mon) |m| self.gpa.free(m.ai_name);
+        for (self.mon) |m| {
+            self.gpa.free(m.ai_name);
+            for (m.tc) |per| for (per) |name| self.gpa.free(name);
+        }
         self.gpa.free(self.mon);
         self.gpa.free(self.lvl);
     }

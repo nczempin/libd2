@@ -4403,12 +4403,18 @@ pub const GameInstance = struct {
         return ls.ground_items.items.len < before;
     }
 
-    /// The compiled item class of `code` (Weapons, then Armor, then Misc rows: the engine's item
-    /// txt id), or -1.
+    /// The engine's item txt id of `code`: its row among Weapons, then Armor, then Misc, not counting
+    /// the tables' "Expansion" divider rows (no code), which the compiled item table leaves out.
+    /// -1 for a code no table has.
     pub fn itemClassId(self: *GameInstance, code: []const u8) i32 {
         self.ensureItemTables() catch return -1;
         const t = &self.item_tables.?;
-        for (t.item_classes, 0..) |ic, i| if (std.mem.eql(u8, ic.code, code)) return @intCast(i);
+        var id: i32 = 0;
+        for (t.item_classes) |ic| {
+            if (ic.code.len == 0) continue;
+            if (std.mem.eql(u8, ic.code, code)) return id;
+            id += 1;
+        }
         return -1;
     }
 
@@ -4580,7 +4586,19 @@ pub const GameInstance = struct {
         };
         const mlvl = @max(1, m.get(.level));
         var tc_buf: [24]u8 = undefined;
-        const tc = std.fmt.bufPrint(&tc_buf, "Act {d} Equip A", .{@as(u16, self.act) + 1}) catch "Act 1 Equip A";
+        // The monster's own MonStats TreasureClass for its rank and the difficulty: 1 a normal
+        // monster or a minion, 2 a champion, 3 a unique or superunique. Without one, an act's
+        // equipment class as before.
+        const own: []const u8 = if (self.mon_combat) |*mc| blk: {
+            const row = mc.combat(@intCast(m.class_id)) orelse break :blk "";
+            const k: usize = switch (m.rank) {
+                .champion => 1,
+                .unique, .superunique => 2,
+                else => 0,
+            };
+            break :blk row.tc[k][@intFromEnum(self.difficulty)];
+        } else "";
+        const tc = if (own.len > 0) own else std.fmt.bufPrint(&tc_buf, "Act {d} Equip A", .{@as(u16, self.act) + 1}) catch "Act 1 Equip A";
 
         var any = false;
         if (self.item_tables != null and self.tc_set != null) {
@@ -7264,7 +7282,8 @@ test "a save-joined player picks a potion into the belt, a scroll into the bag, 
     try ls.ground_items.append(gpa, .{ .guid = 902, .x = me.x, .y = me.y + 2, .code = .{ 'i', 's', 'c', 0 } });
     try ls.ground_items.append(gpa, .{ .guid = 903, .x = me.x + 1, .y = me.y + 1, .code = .{ 'g', 'l', 'd', 0 }, .is_gold = true, .quantity = 37 });
     try ls.ground_items.append(gpa, .{ .guid = 904, .x = me.x + 30, .y = me.y, .code = .{ 'm', 'p', '1', 0 } });
-    try std.testing.expect(gi.itemClassId("mp1") > 500);
+    try std.testing.expectEqual(@as(i32, 592), gi.itemClassId("mp1")); // as the bot's item names count
+    try std.testing.expectEqual(@as(i32, 523), gi.itemClassId("gld"));
     try std.testing.expect(gi.pickGround(c, 901));
     try std.testing.expectEqualStrings("mp1", std.mem.sliceTo(&c.belt[7].code, 0));
     try std.testing.expect(gi.pickGround(c, 902));
@@ -7272,6 +7291,35 @@ test "a save-joined player picks a potion into the belt, a scroll into the bag, 
     try std.testing.expect(gi.pickGround(c, 903));
     try std.testing.expectEqual(@as(i32, 37), me.get(.gold));
     try std.testing.expect(!gi.pickGround(c, 904)); // out of reach
+}
+
+test "a Fallen drops from its own treasure class: gold and potions, not only equipment" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    const ls = try gi.generateLevel();
+    var fallen: ?sim.Unit = null;
+    var it = ls.units.valueIterator();
+    while (it.next()) |u| {
+        if (u.unit_type == .monster and u.class_id == 19 and (u.rank == .normal or u.rank == .minion)) {
+            fallen = u.*;
+            break;
+        }
+    }
+    const before = ls.ground_items.items.len;
+    for (0..200) |_| gi.rollMonsterDrops(ls, fallen.?);
+    var gold: u32 = 0;
+    var potions: u32 = 0;
+    var other: u32 = 0;
+    for (ls.ground_items.items[before..]) |g| {
+        const code = std.mem.sliceTo(&g.code, 0);
+        if (g.is_gold) gold += 1 else if (std.mem.startsWith(u8, code, "hp") or std.mem.startsWith(u8, code, "mp") or std.mem.startsWith(u8, code, "rv")) potions += 1 else other += 1;
+    }
+    // "Act 1 H2H A": NoDrop weighs most; of what drops, gold, potions and junk as well as equipment
+    try std.testing.expect(gold > 10);
+    try std.testing.expect(potions > 10);
+    try std.testing.expect(other < 150);
 }
 
 test "a bag potion shift-clicked goes into the first free belt cell; one right-clicked is drunk" {
