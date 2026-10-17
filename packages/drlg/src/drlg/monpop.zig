@@ -79,6 +79,9 @@ pub const MonStat = struct {
     minion: [2]i32 = .{ -1, -1 }, // minion1 / minion2
     party_min: i32 = 0, // PartyMin
     party_max: i32 = 0, // PartyMax
+    /// Velocity / Run: walking and running speed (a unit moves Velocity/16 subtiles a frame).
+    velocity: i32 = 0, // Velocity
+    run: i32 = 0, // Run
     /// MonStats2.txt fields (linked via MonStats.MonStatsEx -> MonStats2.Id), used by
     /// the spawn-position collision probe: SizeX selects the sampled subtile shape and
     /// spawnCol selects the collision mask (see spawnColMask). Empty spawnCol -> 0.
@@ -244,6 +247,8 @@ pub const Tables = struct {
                     .minion = .{ resolve(&name_to_id, &mt, r, "minion1"), resolve(&name_to_id, &mt, r, "minion2") },
                     .party_min = @intCast(mt.int(r, "PartyMin")),
                     .party_max = @intCast(mt.int(r, "PartyMax")),
+                    .velocity = @intCast(mt.int(r, "Velocity")),
+                    .run = @intCast(mt.int(r, "Run")),
                     .size_x = s2.size_x,
                     .spawn_col = s2.spawn_col,
                     .damage_regen = @intCast(mt.int(r, "DamageRegen")),

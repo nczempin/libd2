@@ -23,7 +23,18 @@ const pf = @import("d2-pathfinding");
 const Unit = unit.Unit;
 const MonsterAI = ai.MonsterAI;
 
-pub const MoveTarget = struct { x: i32, y: i32 };
+/// Where a unit is walking to; `run` for a player's run command (C->S 0x03/0x04).
+pub const MoveTarget = struct { x: i32, y: i32, run: bool = false };
+
+/// A unit's movement clock: the frame it last moved and the fraction of a subtile (in 1/16) it
+/// has covered without reaching the next one. A unit moves Velocity/16 subtiles a frame, the
+/// engine's PATH step ((1024 * (Velocity << 8)) >> 6 over a 4096 direction, in 16.16 coordinates).
+pub const MoveClock = struct {
+    last_frame: u64 = 0,
+    carry: i32 = 0,
+    /// Stamina a running player has spent towards its next whole point, in 1/256.
+    stamina_spent: i32 = 0,
+};
 
 pub const GroundItem = struct {
     guid: u32,
@@ -120,6 +131,8 @@ pub const LevelState = struct {
 
     units: std.AutoHashMapUnmanaged(u32, Unit) = .empty,
     targets: std.AutoHashMapUnmanaged(u32, MoveTarget) = .empty,
+    /// Per-unit movement clocks (see `MoveClock`).
+    move_clock: std.AutoHashMapUnmanaged(u32, MoveClock) = .empty,
     moved: std.AutoHashMapUnmanaged(u32, void) = .empty,
     ai: std.AutoHashMapUnmanaged(u32, MonsterAI) = .empty,
     /// Per-unit fractional life-regen accumulator (<<8): the engine keeps hitpoints in
@@ -204,6 +217,7 @@ pub const LevelState = struct {
     pub fn deinit(self: *LevelState, gpa: std.mem.Allocator) void {
         self.units.deinit(gpa);
         self.targets.deinit(gpa);
+        self.move_clock.deinit(gpa);
         self.moved.deinit(gpa);
         self.ai.deinit(gpa);
         self.regen_acc.deinit(gpa);

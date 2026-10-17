@@ -57,6 +57,14 @@ pub const CharStats = struct {
     /// (dex-15)*factor/(2*clvl) scale. 1.14d: Paladin 30, Amazon/Barbarian/Assassin 25, the
     /// caster classes (Sorceress/Necromancer/Druid) 20.
     block_factor: i32 = 20,
+    /// WalkVelocity / RunVelocity: movement speed, in the units MonStats Velocity uses (a unit
+    /// moves Velocity/16 subtiles a frame; see `GameInstance.moveBudget`).
+    walk_velocity: i32 = 6,
+    run_velocity: i32 = 9,
+    /// RunDrain: stamina spent a frame while running, in 1/256 points.
+    run_drain: i32 = 20,
+    /// ManaRegen: seconds an empty mana pool takes to refill with no bonus.
+    mana_regen: i32 = 120,
 };
 
 /// eD2PlayerClassID order (1.14d): Amazon 0, Sorceress 1, Necromancer 2, Paladin 3,
@@ -103,6 +111,10 @@ fn buildCharStats() [CLASS_NAME.len]CharStats {
             .mana_per_magic = ctsv.cellInt(hdr, row, "ManaPerMagic"),
             .stat_per_level = ctsv.cellInt(hdr, row, "StatPerLevel"),
             .block_factor = ctsv.cellInt(hdr, row, "BlockFactor"),
+            .walk_velocity = ctsv.cellInt(hdr, row, "WalkVelocity"),
+            .run_velocity = ctsv.cellInt(hdr, row, "RunVelocity"),
+            .run_drain = ctsv.cellInt(hdr, row, "RunDrain"),
+            .mana_regen = ctsv.cellInt(hdr, row, "ManaRegen"),
         };
     }
     return out;

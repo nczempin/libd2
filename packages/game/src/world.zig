@@ -550,6 +550,13 @@ pub const World = struct {
 
     /// MonStats.txt DamageRegen for a monster class id (0 if unknown) — drives the
     /// faithful hp-regen stat: hpregen = maxhp * DamageRegen / 16 (engine <<8 space).
+    /// MonStats Velocity (walk) and Run for a monster class: it moves Velocity/16 subtiles a frame.
+    /// Zero when the class is unknown.
+    pub fn monVelocity(self: *World, class_id: i32) [2]i32 {
+        if (self.montbl.stat(class_id)) |ms| return .{ ms.velocity, ms.run };
+        return .{ 0, 0 };
+    }
+
     pub fn monDamageRegen(self: *World, class_id: i32) i32 {
         if (self.montbl.stat(class_id)) |ms| return ms.damage_regen;
         return 0;

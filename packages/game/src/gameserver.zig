@@ -144,6 +144,11 @@ pub const Client = struct {
     /// elemental damage path reads to build an Ice Bolt Cast (skill + synergies + cold mastery).
     /// Populated at spawn from the standalone's stock Hell-Mephisto cold sorc.
     build: sim.character.SorcColdBuild = .{},
+    /// A character's own skill allocation (hard points plus item +skills), for a player joined
+    /// from a `PlayerSpec`. Null for the stock build, whose book `build` derives.
+    book: ?sim.skill.SkillBook = null,
+    /// The potions in the belt (see `BeltCell`).
+    belt: [16]BeltCell = [_]BeltCell{.{}} ** 16,
     /// Active timed buffs on this player (Battle Orders / Frozen Armor / Enchant / ...): granted on
     /// cast, ticked down each frame, removed on expiry. Modifies the player unit's StatList.
     buffs: sim.buff.BuffList = .{},
@@ -198,6 +203,12 @@ pub const Client = struct {
         return self.charname_buf[0..self.charname_len];
     }
 
+    /// The skill levels every cast reads: the character's own when it joined with one, else the
+    /// stock build's.
+    pub fn skillBook(self: *const Client, skills: *const sim.Skills) sim.skill.SkillBook {
+        return self.book orelse self.build.book(skills);
+    }
+
     pub fn deinit(self: *Client, gpa: std.mem.Allocator) void {
         self.revives.deinit(gpa);
         self.known.deinit(gpa);
@@ -240,6 +251,56 @@ pub const Client = struct {
         }
         return null;
     }
+};
+
+/// One belt cell: the Misc.txt code of the potion in it (hp1..hp5, mp1..mp5, rvs, rvl, vps, ...),
+/// empty when `code[0] == 0`. Cells 0..3 are the bottom row, the one the 1..4 keys drink from;
+/// a drink pulls the next potion of the column down (cell + 4, + 8, + 12).
+pub const BeltCell = struct {
+    code: [4]u8 = .{ 0, 0, 0, 0 },
+
+    pub fn empty(self: BeltCell) bool {
+        return self.code[0] == 0;
+    }
+};
+
+/// A real character to join with (`GameInstance.addPlayer`), as a host decodes it from a save.
+pub const PlayerSpec = struct {
+    pub const SkillLevel = struct { id: u16, level: i16 };
+
+    name: []const u8 = "",
+    class_id: u16 = 1, // CharStats row: 0 amazon, 1 sorceress, ...
+    level: i32 = 1,
+    strength: i32 = 10,
+    dexterity: i32 = 25,
+    vitality: i32 = 10,
+    energy: i32 = 35,
+    stat_points: i32 = 0,
+    skill_points: i32 = 0,
+    experience: i32 = 0,
+    gold: i32 = 0,
+    life: i32 = 0, // 0 = full
+    max_life: i32 = 40,
+    mana: i32 = -1, // -1 = full
+    max_mana: i32 = 35,
+    stamina: i32 = -1, // -1 = full
+    max_stamina: i32 = 74,
+    /// Effective skill levels by Skills.txt id: hard points plus item +skills.
+    skills: []const SkillLevel = &.{},
+    left_skill: u16 = DEFAULT_SKILL,
+    right_skill: u16 = DEFAULT_SKILL,
+    weapon_min: i32 = 1,
+    weapon_max: i32 = 3,
+    /// Item defense (the game adds dexterity / 4).
+    defense: i32 = 0,
+    attack_rating: i32 = 0,
+    resist_fire: i32 = 0,
+    resist_cold: i32 = 0,
+    resist_light: i32 = 0,
+    resist_poison: i32 = 0,
+    belt: [16]BeltCell = [_]BeltCell{.{}} ** 16,
+    /// Where to stand, in world subtiles; null = the start level's entry point.
+    at: ?[2]i32 = null,
 };
 
 /// Minimal spinlock guarding shared GameInstance state (std.Thread.Mutex was removed in
@@ -591,6 +652,77 @@ pub const GameInstance = struct {
         c.account_len = @intCast(an);
         const cn = @min(charname.len, c.charname_buf.len);
         @memcpy(c.charname_buf[0..cn], charname[0..cn]);
+        c.charname_len = @intCast(cn);
+
+        try self.clients.append(self.gpa, c);
+        return c;
+    }
+
+    /// Join a real character instead of the stock build: its class, level, attributes, current and
+    /// maximum life/mana/stamina, experience, gold, points, its skill levels (hard points plus item
+    /// +skills, by Skills.txt id), its weapon damage and defense, and the potions in its belt. The
+    /// host decodes these from a save (the C ABI does it from `.d2s` bytes); the game only maps them
+    /// onto the player unit. The player stands at the start level's entry point, or at `at` when given.
+    pub fn addPlayer(self: *GameInstance, conn: i32, spec: PlayerSpec) !*Client {
+        const start = try self.ensureLevel(self.level_id);
+        self.ensureSkillTables() catch {};
+
+        const guid = self.allocGuid();
+        var u = sim.Unit.init(.player);
+        u.unit_id = guid;
+        u.class_id = spec.class_id;
+        u.set(.level, spec.level);
+        u.set(.strength, spec.strength);
+        u.set(.energy, spec.energy);
+        u.set(.dexterity, spec.dexterity);
+        u.set(.vitality, spec.vitality);
+        u.set(.statpts, spec.stat_points);
+        u.set(.newskills, spec.skill_points);
+        u.set(.experience, spec.experience);
+        u.set(.gold, spec.gold);
+        u.set(.armorclass, spec.defense + @divTrunc(spec.dexterity, 4));
+        u.set(.tohit, spec.attack_rating);
+        u.set(.fireresist, spec.resist_fire);
+        u.set(.coldresist, spec.resist_cold);
+        u.set(.lightresist, spec.resist_light);
+        u.set(.poisonresist, spec.resist_poison);
+        u.set(.maxhp, spec.max_life);
+        u.setLife(if (spec.life > 0) spec.life else spec.max_life);
+        u.set(.maxmana, spec.max_mana);
+        u.set(.mana, if (spec.mana >= 0) spec.mana else spec.max_mana);
+        u.set(.maxstamina, spec.max_stamina);
+        u.set(.stamina, if (spec.stamina >= 0) spec.stamina else spec.max_stamina);
+        u.weapon = .{ .min_damage = spec.weapon_min, .max_damage = spec.weapon_max };
+
+        var book = sim.skill.SkillBook{};
+        for (spec.skills) |s| book.set(s.id, s.level);
+
+        const at_x = if (spec.at) |p| p[0] else start.entry_x;
+        const at_y = if (spec.at) |p| p[1] else start.entry_y;
+        u.x = at_x;
+        u.y = at_y;
+        u.collision = sim.unit.Collision.player(PLAYER_SIZE_X);
+        try start.units.put(self.gpa, guid, u);
+        start.settle(guid, start.units.getPtr(guid).?);
+        errdefer _ = start.units.remove(guid);
+
+        const c = try self.gpa.create(Client);
+        errdefer self.gpa.destroy(c);
+        c.* = .{
+            .conn = conn,
+            .player_guid = guid,
+            .level_id = self.level_id,
+            .x = at_x,
+            .y = at_y,
+            .book = book,
+            .left_skill = spec.left_skill,
+            .right_skill = spec.right_skill,
+            .belt = spec.belt,
+            .outbuf = try self.gpa.alloc(u8, OUT_BUF),
+        };
+        errdefer self.gpa.free(c.outbuf);
+        const cn = @min(spec.name.len, c.charname_buf.len);
+        @memcpy(c.charname_buf[0..cn], spec.name[0..cn]);
         c.charname_len = @intCast(cn);
 
         try self.clients.append(self.gpa, c);
@@ -1238,14 +1370,14 @@ pub const GameInstance = struct {
                 // opcode-gated on 0x01 and would reject a 0x03 run).
                 const x = std.mem.readInt(u16, buf[1..3], .little);
                 const y = std.mem.readInt(u16, buf[3..5], .little);
-                ls.targets.put(self.gpa, c.player_guid, .{ .x = x, .y = y }) catch {};
+                ls.targets.put(self.gpa, c.player_guid, .{ .x = x, .y = y, .run = op == .run_to_location }) catch {};
             },
             .walk_to_entity, .run_to_entity => {
                 // Walk (0x02) and run (0x04) share the EntityCmd payload; decode the guid
                 // directly (the opcode-gated decoders would reject the other opcode).
                 const guid = std.mem.readInt(u32, buf[5..9], .little);
                 if (ls.units.getPtr(guid)) |t| {
-                    ls.targets.put(self.gpa, c.player_guid, .{ .x = t.x, .y = t.y }) catch {};
+                    ls.targets.put(self.gpa, c.player_guid, .{ .x = t.x, .y = t.y, .run = op == .run_to_entity }) catch {};
                 }
             },
             .select_skill => {
@@ -1618,7 +1750,7 @@ pub const GameInstance = struct {
             .buff_self => |b| {
                 if (self.buff_ctx) |*bx| {
                     const caster = ls.units.getPtr(c.player_guid) orelse return;
-                    const bk = c.build.book(&self.skills.?);
+                    const bk = c.skillBook(&self.skills.?);
                     bx.cast(&c.buffs, caster, &self.skills.?, bk, b.skill_id, bk.get(b.skill_id));
                 }
             },
@@ -1630,7 +1762,7 @@ pub const GameInstance = struct {
                         c.form_skill = 0;
                     } else {
                         if (c.form_skill != 0) c.buffs.remove(caster, c.form_skill);
-                        const bk = c.build.book(&self.skills.?);
+                        const bk = c.skillBook(&self.skills.?);
                         c.buffs.apply(caster, &self.skills.?, &bx.isc, sh.skill_id, bk.get(sh.skill_id), std.math.maxInt(i32));
                         c.form_skill = sh.skill_id;
                     }
@@ -1640,7 +1772,7 @@ pub const GameInstance = struct {
                 if (self.skills == null) return;
                 const tu = ls.units.getPtr(pd.target_guid) orelse return;
                 const sk = &self.skills.?;
-                const hit = sim.skill.castDirectElemental(sk, c.build.book(sk), pd.skill_id, pd.level, tu, &self.combat_seed);
+                const hit = sim.skill.castDirectElemental(sk, c.skillBook(sk), pd.skill_id, pd.level, tu, &self.combat_seed);
                 const sd = sk.byId(pd.skill_id) orelse return;
                 ls.poison_dots.put(self.gpa, pd.target_guid, sim.skill.poisonOverTime(hit, sd.e_len)) catch {};
             },
@@ -1652,7 +1784,7 @@ pub const GameInstance = struct {
                 if (cu.target_guid == 0) return;
                 if (ls.units.getPtr(cu.target_guid)) |tu| {
                     if (sim.select.isHostileMonster(tu)) {
-                        const book = c.build.book(sk);
+                        const book = c.skillBook(sk);
                         const cc: i32 = @max(1, @as(i32, c.charge_count));
                         const prgdam = if (sk.rowById(cu.skill_id)) |row| (sk.table.getInt(i32, row, "prgdam") orelse 0) else 0;
                         const ed: i32 = if (prgdam == 1) sk.evalCalc(book, 0, cu.skill_id, cu.level, "calc1") * cc else 0;
@@ -1696,7 +1828,7 @@ pub const GameInstance = struct {
             .spawn_missiles => |sm| {
                 const md = if (self.missile_data) |*m| m else return;
                 const sk = if (self.skills) |*s| s else return;
-                const book = c.build.book(sk);
+                const book = c.skillBook(sk);
                 var syn: [sim.spell.MAX_SYNERGIES]sim.spell.Synergy = undefined;
                 const cst = sim.skill.castElemental(sk, book, sm.skill_id, sm.level, &syn);
                 switch (sm.kind) {
@@ -1731,7 +1863,7 @@ pub const GameInstance = struct {
                 const clvl = corpse.get(.level);
                 const cclass = corpse.class_id;
                 const caster_level = if (ls.units.getPtr(c.player_guid)) |u| @max(1, u.get(.level)) else 1;
-                const book = c.build.book(sk);
+                const book = c.skillBook(sk);
                 switch (csk.kind) {
                     .explode => {
                         const hit = sim.skill.corpseExplosion(sk, book, csk.level, cmaxhp, caster_level, clvl, &self.combat_seed);
@@ -1807,7 +1939,7 @@ pub const GameInstance = struct {
                 if (ws.reposition) self.repositionPlayer(ls, c, caster, tu.x, tu.y);
                 if (!sim.select.isHostileMonster(tu)) return;
                 const sk = &self.skills.?;
-                const book = c.build.book(sk);
+                const book = c.skillBook(sk);
                 if (ws.use_melee_skill) {
                     const res = sim.skill.resolveMeleeSkill(sk, book, caster, tu, ws.skill_id, book.get(ws.skill_id), &self.combat_seed);
                     if (res.total_damage > 0) sim.combat.applyToLife(tu, res.total_damage);
@@ -1822,7 +1954,7 @@ pub const GameInstance = struct {
             .elemental_area => |ea| {
                 if (self.skills == null) return;
                 const sk = &self.skills.?;
-                const book = c.build.book(sk);
+                const book = c.skillBook(sk);
                 var tgts: std.ArrayListUnmanaged(*sim.Unit) = .empty;
                 defer tgts.deinit(self.gpa);
                 var it = ls.units.valueIterator();
@@ -1967,7 +2099,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .teleport) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -1994,7 +2126,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.is_aura) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2035,7 +2167,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.is_summon) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2049,7 +2181,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .cast_curse_aoe or sdd.doFunc() == .inner_sight) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    const book = c.build.book(sk);
+                    const book = c.skillBook(sk);
                     for (sim.skill.resolve(sk, book, skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
@@ -2068,7 +2200,7 @@ pub const GameInstance = struct {
                 switch (sdd.doFunc()) {
                     .corpse_explosion, .poison_explosion, .revive_corpse_check => {
                         var ebuf: [4]sim.effect.Effect = undefined;
-                        for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                        for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                         return;
                     },
                     else => {},
@@ -2089,7 +2221,7 @@ pub const GameInstance = struct {
                 switch (sdd.doFunc()) {
                     .blaze_energy_shield, .fire_wall, .meteor_blizzard, .volcano, .armageddon => {
                         var ebuf: [4]sim.effect.Effect = undefined;
-                        const effs = sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf);
+                        const effs = sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf);
                         if (effs.len > 0) {
                             for (effs) |e| self.applyEffect(c, ls, e);
                             return;
@@ -2107,7 +2239,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .grim_ward or (sdd.doFunc() == .nova_frost_nova and sdd.dmg.etype == .none)) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2122,7 +2254,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .blessed_hammer and self.missile_data != null) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2140,7 +2272,7 @@ pub const GameInstance = struct {
                 // the burst radius around the cast point. FoH's descending holy bolt (magic) is a refinement.
                 if (sdd.doFunc() == .meteor_blizzard or sdd.doFunc() == .fist_of_the_heavens) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    const effs = sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf);
+                    const effs = sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf);
                     if (effs.len > 0) {
                         for (effs) |e| self.applyEffect(c, ls, e);
                         return;
@@ -2157,7 +2289,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if ((sdd.doFunc() == .multi_shot or sdd.doFunc() == .charged_bolt or sdd.doFunc() == .guided_arrow_launch) and self.missile_data != null) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2175,7 +2307,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .elemental_charge_release or sdd.doFunc() == .charge_up_stack_melee) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2190,7 +2322,7 @@ pub const GameInstance = struct {
                 switch (sdd.doFunc()) {
                     .generic_melee_hit, .multi_hit_attack, .sacrifice, .smite, .charge, .dragon_flight, .frenzy_melee_hit, .double_swing, .throw_weapon_left_hand, .throw_weapon_right_hand, .jab, .charged_strike, .lightning_strike, .dragon_talon, .dragon_claw, .dragon_tail_fire_explosion, .double_throw, .melee_attack_with_missile_wrapper, .feral_rage, .rabies, .hunger => {
                         var ebuf: [4]sim.effect.Effect = undefined;
-                        for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                        for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                         return;
                     },
                     else => {},
@@ -2209,7 +2341,7 @@ pub const GameInstance = struct {
                 switch (sdd.doFunc()) {
                     .whirlwind, .leap, .leap_attack => {
                         var ebuf: [4]sim.effect.Effect = undefined;
-                        for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                        for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                         return;
                     },
                     else => {},
@@ -2225,7 +2357,7 @@ pub const GameInstance = struct {
             if (sk.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .static) {
                     var ebuf: [4]sim.effect.Effect = undefined;
-                    for (sim.skill.resolve(sk, c.build.book(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
+                    for (sim.skill.resolve(sk, c.skillBook(sk), skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                     return;
                 }
             }
@@ -2240,7 +2372,7 @@ pub const GameInstance = struct {
         if (tgt_unit) |_| {
             if (self.skills.?.byId(skill_id)) |sdd| {
                 if (sdd.doFunc() == .apply_direct_damage and sdd.dmg.etype == .poison) {
-                    self.applyEffect(c, ls, .{ .poison_dot = .{ .target_guid = target.guid, .skill_id = skill_id, .level = c.build.book(&self.skills.?).get(skill_id) } });
+                    self.applyEffect(c, ls, .{ .poison_dot = .{ .target_guid = target.guid, .skill_id = skill_id, .level = c.skillBook(&self.skills.?).get(skill_id) } });
                     return;
                 }
             }
@@ -2262,7 +2394,7 @@ pub const GameInstance = struct {
         if (self.skills.?.byId(skill_id)) |sdd| {
             if (sdd.doFunc() == .nova_frost_nova and sdd.dmg.etype != .none) { // elemental Nova ring; Howl (no element) falls through to the fear branch
                 var syn: [sim.spell.MAX_SYNERGIES]sim.spell.Synergy = undefined;
-                const book = c.build.book(&self.skills.?);
+                const book = c.skillBook(&self.skills.?);
                 const cst = sim.skill.castElemental(&self.skills.?, book, skill_id, book.get(skill_id), &syn);
                 var ring: [64]sim.Missile = undefined;
                 const n = sim.skill.castRadialMissiles(&self.skills.?, &self.missile_data.?, c.player_guid, skill_id, caster.x, caster.y, 64, cst, &ring);
@@ -2285,7 +2417,7 @@ pub const GameInstance = struct {
                 switch (sdd.doFunc()) {
                     .cloak_of_shadows, .mind_blast, .attract, .confuse, .taunt, .conversion => {
                         var ebuf: [4]sim.effect.Effect = undefined;
-                        const book = c.build.book(sk);
+                        const book = c.skillBook(sk);
                         for (sim.skill.resolve(sk, book, skill_id, caster.x, caster.y, target.x, target.y, target.guid, &ebuf)) |e| self.applyEffect(c, ls, e);
                         return;
                     },
@@ -2304,7 +2436,7 @@ pub const GameInstance = struct {
             if ((k == .direct or k == .other) and target.guid != 0) {
                 if (ls.units.getPtr(target.guid)) |tu| {
                     if (sim.select.isHostileMonster(tu)) {
-                        const book = c.build.book(&self.skills.?);
+                        const book = c.skillBook(&self.skills.?);
                         const lvl = book.get(skill_id);
                         if (sdd.dmg.etype != .none) {
                             var one = [_]*sim.Unit{tu};
@@ -2325,7 +2457,7 @@ pub const GameInstance = struct {
         var have_cst = false;
         const outcome = if (is_elem_missile) blk: {
             var syn: [sim.spell.MAX_SYNERGIES]sim.spell.Synergy = undefined;
-            const book = c.build.book(&self.skills.?);
+            const book = c.skillBook(&self.skills.?);
             elem_cst = sim.skill.castElemental(&self.skills.?, book, skill_id, book.get(skill_id), &syn).seal(); // seal while syn is alive
             have_cst = true;
             break :blk sim.skill.cast(&self.skills.?, &self.missile_data.?, caster, skill_id, st, elem_cst);
@@ -2341,7 +2473,7 @@ pub const GameInstance = struct {
             if (have_cst) {
                 if (self.missile_data.?.byName(sd.?.srvmissile)) |md| {
                     if ((md.srv_do_func == 15 or md.srv_do_func == 10) and md.sub_missile1.len != 0) {
-                        const bk = c.build.book(&self.skills.?);
+                        const bk = c.skillBook(&self.skills.?);
                         const el = bk.get(skill_id);
                         // func 15 (Frozen Orb): interval = missile Param1, 1 rotating shot. func 10
                         // (Blizzard/Hydra): interval = skill calc[1], count = skill calc[0] random shots.
@@ -3410,7 +3542,7 @@ pub const GameInstance = struct {
             const row = sk.rowById(c.active_aura) orelse continue;
             const filter = sk.table.getInt(i32, row, "aurafilter") orelse 0;
             const ls = self.levels.get(c.level_id) orelse continue;
-            const book = c.build.book(sk);
+            const book = c.skillBook(sk);
             const lvl = book.get(c.active_aura);
             if (filter & AURA_TARGETS_OWN_SIDE != 0) {
                 // Ally aura (Might / Concentration / ...): self-apply to the caster.
@@ -3567,10 +3699,22 @@ pub const GameInstance = struct {
     /// Returns true once the unit has arrived at the final target. `is_player` selects the engine's
     /// player path shape (PATH_ExtendPathEndpoint), matching how D2 routes players vs. monsters.
     fn moveUnitToward(self: *GameInstance, ls: *LevelState, u: *sim.Unit, guid: u32, tx: i32, ty: i32, step_in: i32, is_player: bool) bool {
-        // A CHILLED unit (Duriel Holy-Freeze aura) crawls at half step until its chill lapses.
-        var step = step_in;
+        if (u.x == tx and u.y == ty) return true;
+        // The unit's own speed (Velocity/16 subtiles a frame) when the tables know it; `step_in`, the
+        // old flat pacing, only for a unit they do not.
+        var vel = self.unitVelocity(ls, u, guid, is_player);
+        // A CHILLED unit (Duriel Holy-Freeze aura) crawls at half speed until its chill lapses.
+        var chilled = false;
         if (ls.chilled.get(guid)) |end| {
-            if (self.tick_count < end) step = @max(1, @divTrunc(step_in, 2)) else _ = ls.chilled.remove(guid);
+            if (self.tick_count < end) chilled = true else _ = ls.chilled.remove(guid);
+        }
+        var step = step_in;
+        if (vel > 0) {
+            if (chilled) vel = @max(1, @divTrunc(vel, 2));
+            step = self.moveBudget(ls, guid, vel);
+            if (step == 0) return false;
+        } else if (chilled) {
+            step = @max(1, @divTrunc(step_in, 2));
         }
         var used_path = false;
         if (self.pathStep(ls, u, guid, tx, ty, is_player, step)) |dest| {
@@ -3597,6 +3741,46 @@ pub const GameInstance = struct {
         ls.settle(guid, u);
         ls.moved.put(self.gpa, guid, {}) catch {};
         return reached;
+    }
+
+    /// Longest stretch of frames one move may catch up on: a unit that stood still does not leap.
+    const MOVE_CATCHUP_FRAMES: u64 = 4;
+
+    /// Whole subtiles a unit moving at `vel` may cover now: Velocity/16 a frame for every frame since
+    /// it last moved (capped), with the remainder carried to the next move.
+    fn moveBudget(self: *GameInstance, ls: *LevelState, guid: u32, vel: i32) i32 {
+        const e = ls.move_clock.getOrPut(self.gpa, guid) catch return @max(1, @divTrunc(vel, 16));
+        if (!e.found_existing) e.value_ptr.* = .{ .last_frame = self.tick_count -| 1 };
+        const frames = @min(self.tick_count -| e.value_ptr.last_frame, MOVE_CATCHUP_FRAMES);
+        if (frames == 0) return 0;
+        const budget = e.value_ptr.carry + vel * @as(i32, @intCast(frames));
+        e.value_ptr.last_frame = self.tick_count;
+        e.value_ptr.carry = @mod(budget, 16);
+        return @divTrunc(budget, 16);
+    }
+
+    /// A unit's movement speed in Velocity units: a player's CharStats run speed while it runs with
+    /// stamina left (spending RunDrain/256 stamina a frame), else its walk speed; a monster's MonStats
+    /// Velocity. Zero when unknown.
+    fn unitVelocity(self: *GameInstance, ls: *LevelState, u: *sim.Unit, guid: u32, is_player: bool) i32 {
+        if (is_player or u.unit_type == .player) {
+            if (u.class_id > 6) return 0;
+            const stats = sim.derive.charStats(@enumFromInt(@as(u8, @intCast(u.class_id))));
+            const running = if (ls.targets.get(guid)) |t| t.run else false;
+            if (running and u.get(.stamina) > 0) {
+                const e = ls.move_clock.getOrPut(self.gpa, guid) catch return stats.run_velocity;
+                if (!e.found_existing) e.value_ptr.* = .{ .last_frame = self.tick_count -| 1 };
+                e.value_ptr.stamina_spent += stats.run_drain;
+                if (e.value_ptr.stamina_spent >= 256) {
+                    u.set(.stamina, @max(0, u.get(.stamina) - @divTrunc(e.value_ptr.stamina_spent, 256)));
+                    e.value_ptr.stamina_spent = @mod(e.value_ptr.stamina_spent, 256);
+                }
+                return stats.run_velocity;
+            }
+            return stats.walk_velocity;
+        }
+        if (self.world) |*w| return w.monVelocity(@intCast(u.class_id))[0];
+        return 0;
     }
 
     // --- death + loot -------------------------------------------------------
@@ -4731,10 +4915,31 @@ test "walk sets a target and tick moves the player toward it" {
     _ = gi.handleCommand(c, walk.encode(&buf));
     try std.testing.expect(ls.targets.contains(c.player_guid));
 
-    gi.tick(&sink);
+    // A walking sorceress covers WalkVelocity/16 = 6/16 of a subtile a frame: three frames reach one.
+    for (0..3) |_| gi.tick(&sink);
     const new_x = ls.units.getPtr(c.player_guid).?.x;
     try std.testing.expect(new_x != start_x);
     try std.testing.expect(ls.moved.contains(c.player_guid));
+}
+
+test "a unit moves at its table speed: Velocity/16 subtiles a frame" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 0x13572468, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    const c = try gi.addPlayer(-1, .{ .level = 2 });
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    const sx = me.x;
+    // Walk (CharStats WalkVelocity 6): 160 frames = 60 subtiles; run (RunVelocity 9) the same span = 90.
+    var walked: i32 = 0;
+    for (0..160) |_| {
+        gi.tick_count += 1;
+        _ = gi.moveUnitToward(ls, me, c.player_guid, sx + 1000, me.y, 99, true);
+    }
+    walked = @intCast(@abs(me.x - sx));
+    try std.testing.expect(walked >= 55 and walked <= 60);
 }
 
 /// A bare level for tests: `w`x`h` of open floor with nothing on it. Its origin is (0,0), so
@@ -4786,9 +4991,10 @@ test "player routes around a wall instead of walking through it" {
     var reached = false;
     var max_y: i32 = 0;
     var ticks: usize = 0;
-    while (ticks < 500) : (ticks += 1) {
+    while (ticks < 2000) : (ticks += 1) {
         const up = ls.units.getPtr(guid).?;
         max_y = @max(max_y, up.y);
+        gi.tick_count += 1;
         if (gi.moveUnitToward(&ls, up, guid, target_x, target_y, MOVE_STEP, true)) {
             reached = true;
             break;
@@ -4903,11 +5109,12 @@ test "a player routes through the free gap when a monster is standing in the nea
     var max_y: i32 = 0;
     var reached = false;
     var ticks: usize = 0;
-    while (ticks < 400) : (ticks += 1) {
+    while (ticks < 2000) : (ticks += 1) {
         const up = ls.units.getPtr(pguid).?;
         max_y = @max(max_y, up.y);
         // Never on the monster, never in the wall.
         try std.testing.expect(!(up.x == 20 and up.y == 10));
+        gi.tick_count += 1;
         if (gi.moveUnitToward(&ls, up, pguid, 35, 10, MOVE_STEP, true)) {
             reached = true;
             break;
@@ -4927,11 +5134,17 @@ test "a player routes through the free gap when a monster is standing in the nea
     ls.settle(pguid, back);
     max_y = 0;
     ticks = 0;
-    while (ticks < 400) : (ticks += 1) {
+    var arrived = false;
+    while (ticks < 2000) : (ticks += 1) {
         const up = ls.units.getPtr(pguid).?;
         max_y = @max(max_y, up.y);
-        if (gi.moveUnitToward(&ls, up, pguid, 35, 10, MOVE_STEP, true)) break;
+        gi.tick_count += 1;
+        if (gi.moveUnitToward(&ls, up, pguid, 35, 10, MOVE_STEP, true)) {
+            arrived = true;
+            break;
+        }
     }
+    try std.testing.expect(arrived);
     try std.testing.expectEqual(@as(i32, 10), max_y);
 }
 
