@@ -6068,3 +6068,37 @@ test "runHeadless drives a game with a buffer sink and captures the join burst +
     try std.testing.expect(run.flushes.items[0].bytes.len > 0); // a real join burst went out
     try std.testing.expectEqual(@as(u32, 3), run.flushes.items[3].tick);
 }
+
+
+test "Den of Evil packs: shamans lead fallen parties, Corpsefire leads five zombies, counts near a live game" {
+    // Seed of a live 1.14d-rules D2R game whose Den of Evil was cleared by a bot: it killed 33 Fallen,
+    // 8 Fallen Shamans, 4 Gargantuan Beasts and 10 Zombies (Corpsefire's five among them).
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    const ls = try gi.generateLevel();
+    var fallen: u32 = 0;
+    var shamans: u32 = 0;
+    var zombies: u32 = 0;
+    var beasts: u32 = 0;
+    var bosses: u32 = 0;
+    var it = ls.units.valueIterator();
+    while (it.next()) |u| {
+        if (u.unit_type != .monster) continue;
+        try std.testing.expect(ls.passable(u.x, u.y, sim.collision.Colmask.spawn) or ls.level == null);
+        switch (u.class_id) {
+            19 => fallen += 1, // fallen1
+            58 => shamans += 1, // fallenshaman1
+            5 => zombies += 1, // zombie1, Corpsefire's base class
+            28 => beasts += 1, // brute1
+            else => {},
+        }
+        if (u.class_id >= 734) bosses += 1; // a preset id left in the SuperUniques space
+    }
+    try std.testing.expectEqual(@as(u32, 0), bosses);
+    try std.testing.expect(shamans >= 6 and shamans <= 10);
+    try std.testing.expect(fallen >= 2 * shamans and fallen <= 6 * shamans + 6);
+    try std.testing.expect(zombies >= 6); // Corpsefire and his five
+    try std.testing.expect(beasts >= 2 and beasts <= 6);
+}

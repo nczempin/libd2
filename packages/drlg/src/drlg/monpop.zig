@@ -72,6 +72,13 @@ pub const MonStat = struct {
     spawn: i32, // spawn (resolved class id, -1 = none) — spawn-replacement target
     place_spawn: i32, // placespawn
     base_id: i32, // BaseId (resolved class id) — fallen(19)/scarab(91) check
+    /// The party a freshly spawned monster brings along (MONSTERSPAWN party roll, 1.10f
+    /// D2Game.0x6FC69C00 in D2MOO): PartyMin + rand(PartyMax - PartyMin + 1) minions,
+    /// alternating minion1 / minion2 (resolved class ids, -1 = none). A minion itself
+    /// spawns with the minion flag and brings no party of its own.
+    minion: [2]i32 = .{ -1, -1 }, // minion1 / minion2
+    party_min: i32 = 0, // PartyMin
+    party_max: i32 = 0, // PartyMax
     /// MonStats2.txt fields (linked via MonStats.MonStatsEx -> MonStats2.Id), used by
     /// the spawn-position collision probe: SizeX selects the sampled subtile shape and
     /// spawnCol selects the collision mask (see spawnColMask). Empty spawnCol -> 0.
@@ -135,6 +142,15 @@ pub const LevelMon = struct {
     umon: []i32, // unique-monster pool (normal-difficulty unique packs)
 };
 
+/// One SuperUniques.txt row: the base monster class and the pack it leads (MinGrp..MaxGrp
+/// minions of the same class), plus its MonUMod modifiers.
+pub const SuperUnique = struct {
+    class_id: i32, // Class (resolved MonStats class id, -1 = unresolved)
+    min_grp: i32, // MinGrp
+    max_grp: i32, // MaxGrp
+    mods: [3]i32, // Mod1..Mod3 (MonUMod ids, 0 = none)
+};
+
 /// One MonLvl.txt row: the per-monster-level stat MULTIPLIERS (percent). Indexed by
 /// monster level (dense, index == the row's Level value). Only HP is modeled here (the
 /// other columns AC/TH/DM/XP follow the same D2ApplyPercent(MonLvl.col, MonStats, 100)
@@ -154,6 +170,8 @@ pub const Tables = struct {
     /// MonLvl.txt HP-scale rows indexed by monster level (0..nTxtMonLvlSize-1). The engine
     /// clamps a monster level above the last row to the last row (MONSTER_CalculateLevelScaledStats).
     mon_lvl: []MonLvlRow,
+    /// SuperUniques.txt rows in hcIdx order.
+    super_uniques: []SuperUnique,
 
     pub fn load(gpa: std.mem.Allocator) !Tables {
         var mt = try txt.Table.parse(gpa, d2data.file("MonStats"));
@@ -223,6 +241,9 @@ pub const Tables = struct {
                     .spawn = resolve(&name_to_id, &mt, r, "spawn"),
                     .place_spawn = @intCast(mt.int(r, "placespawn")),
                     .base_id = resolve(&name_to_id, &mt, r, "BaseId"),
+                    .minion = .{ resolve(&name_to_id, &mt, r, "minion1"), resolve(&name_to_id, &mt, r, "minion2") },
+                    .party_min = @intCast(mt.int(r, "PartyMin")),
+                    .party_max = @intCast(mt.int(r, "PartyMax")),
                     .size_x = s2.size_x,
                     .spawn_col = s2.spawn_col,
                     .damage_regen = @intCast(mt.int(r, "DamageRegen")),
@@ -355,7 +376,25 @@ pub const Tables = struct {
             }
         }
 
-        return .{ .gpa = gpa, .mon_stats = mon_stats, .levels = levels, .max_level_id = max_id, .mon_lvl = mon_lvl };
+        // SuperUniques.txt, indexed by hcIdx order (the row index): a level preset names a
+        // superunique by mon_stats.len + that index, in the same id space as a MonStats class.
+        var sut = try txt.Table.parse(gpa, d2data.file("SuperUniques"));
+        defer sut.deinit();
+        const super_uniques = try gpa.alloc(SuperUnique, sut.rowCount());
+        errdefer gpa.free(super_uniques);
+        {
+            var r: usize = 0;
+            while (r < sut.rowCount()) : (r += 1) {
+                super_uniques[r] = .{
+                    .class_id = resolve(&name_to_id, &sut, r, "Class"),
+                    .min_grp = @intCast(sut.int(r, "MinGrp")),
+                    .max_grp = @intCast(sut.int(r, "MaxGrp")),
+                    .mods = .{ @intCast(sut.int(r, "Mod1")), @intCast(sut.int(r, "Mod2")), @intCast(sut.int(r, "Mod3")) },
+                };
+            }
+        }
+
+        return .{ .gpa = gpa, .mon_stats = mon_stats, .levels = levels, .max_level_id = max_id, .mon_lvl = mon_lvl, .super_uniques = super_uniques };
     }
 
     pub fn deinit(self: *Tables) void {
@@ -367,11 +406,22 @@ pub const Tables = struct {
         self.gpa.free(self.levels);
         self.gpa.free(self.mon_stats);
         self.gpa.free(self.mon_lvl);
+        self.gpa.free(self.super_uniques);
     }
 
     pub fn stat(self: *const Tables, class_id: i32) ?*const MonStat {
         if (class_id < 0 or class_id >= self.mon_stats.len) return null;
         return &self.mon_stats[@intCast(class_id)];
+    }
+
+    /// The superunique a preset id names, when it lies past the MonStats classes (the preset
+    /// id space continues into SuperUniques.txt: id = mon_stats.len + hcIdx).
+    pub fn superUnique(self: *const Tables, preset_id: i32) ?*const SuperUnique {
+        const n: i32 = @intCast(self.mon_stats.len);
+        if (preset_id < n) return null;
+        const i = preset_id - n;
+        if (i >= self.super_uniques.len) return null;
+        return &self.super_uniques[@intCast(i)];
     }
 
     pub fn levelMon(self: *const Tables, level_id: i32) ?*const LevelMon {

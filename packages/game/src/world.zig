@@ -267,7 +267,7 @@ pub fn generatePopulated(
     defer ctx.deinit();
     var montbl = try realdrlg.monpop.Tables.load(gpa);
     defer montbl.deinit();
-    return populateSingle(&ctx, &montbl, gpa, seed, level_id, difficulty);
+    return populateSingle(&ctx, &montbl, gpa, seed, level_id, difficulty, null);
 }
 
 /// The INTERIOR single-level populate: byte-exact `generate()` + faithful per-room
@@ -280,6 +280,10 @@ fn populateSingle(
     seed: u32,
     level_id: u16,
     difficulty: Difficulty,
+    /// The level's live map, when the caller has one: the density slots then follow the room's
+    /// walkable regions (see `populateRoom`). Its level-local cells are this function's
+    /// coordinates, since the level is generated here at a world position of zero.
+    live: ?*const Level,
 ) !Populated {
     const diff: realdrlg.Difficulty = @enumFromInt(@intFromEnum(difficulty));
 
@@ -363,24 +367,7 @@ fn populateSingle(
         if (rg) |region| {
             region.n_rooms_count += 1;
             var room_seed = p.sSeed;
-            const rctx = realdrlg.monpop.RoomCtx{
-                .x_start = sx,
-                .y_start = sy,
-                .x_size = ssx,
-                .y_size = ssy,
-            };
-            var tmp: std.ArrayListUnmanaged(realdrlg.monpop.MonSpawn) = .empty;
-            defer tmp.deinit(gpa);
-            _ = realdrlg.monpop.spawnRoomMonsters(region, montbl, lm.?, &game_seed, &room_seed, &rctx, is_not_normal, &tmp, gpa, null);
-            for (tmp.items) |ms| {
-                try spawns.append(gpa, .{
-                    .class_id = ms.class_id,
-                    .x = ms.x,
-                    .y = ms.y,
-                    .count = ms.count,
-                    .unique = ms.flags.unique,
-                });
-            }
+            try populateRoom(gpa, region, montbl, lm.?, &game_seed, &room_seed, .{ .x = sx, .y = sy, .w = ssx, .h = ssy }, .{ .x = 0, .y = 0 }, live, is_not_normal, &spawns);
         }
     }
 
@@ -662,12 +649,13 @@ pub const World = struct {
     /// live map. Everything that comes out is in world subtiles.
     pub fn populated(self: *World, level_id: u16) !Populated {
         const outdoor = self.isOutdoor(level_id);
+        const live = try self.levelMap(level_id);
         var pop = if (outdoor)
-            try self.populatedOutdoor(level_id)
+            try self.populatedOutdoor(level_id, live)
         else
-            try populateSingle(&self.ctx, &self.montbl, self.gpa, self.seed, level_id, self.difficulty);
+            try populateSingle(&self.ctx, &self.montbl, self.gpa, self.seed, level_id, self.difficulty, live);
         errdefer pop.deinit(self.gpa);
-        pop.level = try self.levelMap(level_id);
+        pop.level = live;
         if (pop.level) |lv| {
             pop.summary.collision_cells = @intCast(@max(0, lv.w) * @max(0, lv.h));
             if (!outdoor) pop.rebase(lv.origin_x, lv.origin_y);
@@ -681,6 +669,9 @@ pub const World = struct {
                 pop.entry_x = wp.x;
                 pop.entry_y = wp.y;
             }
+            const packs = try expandPacks(self.gpa, &self.montbl, lv, self.seed, level_id, pop.spawns);
+            self.gpa.free(pop.spawns);
+            pop.spawns = packs;
         }
         return pop;
     }
@@ -688,8 +679,8 @@ pub const World = struct {
     /// Build a Populated for an OUTDOOR level out of the cached whole-act result: rooms
     /// come from the placement graph, monsters from the faithful buildAllRegions/
     /// spawnRoomMonsters roster run over the extracted rooms. Collision is not built here —
-    /// `populated` attaches the live map.
-    fn populatedOutdoor(self: *World, level_id: u16) !Populated {
+    /// `populated` attaches the live map, which `live` is when the caller has it.
+    fn populatedOutdoor(self: *World, level_id: u16, live: ?*const Level) !Populated {
         const act_no = self.levelAct(level_id);
         const ad = try self.ensureAct(act_no);
         const gpa = self.gpa;
@@ -748,13 +739,9 @@ pub const World = struct {
                 // so derive a deterministic per-room seed from the game seed + room world
                 // position. Faithful roster + density; room-local placement is a residual.
                 var room_seed = deriveRoomSeed(self.seed, r.x, r.y, idx);
-                const rctx = realdrlg.monpop.RoomCtx{ .x_start = sx, .y_start = sy, .x_size = ssx, .y_size = ssy };
-                var tmp: std.ArrayListUnmanaged(realdrlg.monpop.MonSpawn) = .empty;
-                defer tmp.deinit(gpa);
-                _ = realdrlg.monpop.spawnRoomMonsters(region, &self.montbl, lm.?, &game_seed, &room_seed, &rctx, is_not_normal, &tmp, gpa, null);
-                for (tmp.items) |ms| {
-                    try spawns.append(gpa, .{ .class_id = ms.class_id, .x = ms.x, .y = ms.y, .count = ms.count, .unique = ms.flags.unique });
-                }
+                // Outdoor rooms are in world coordinates; the live map's cells are level-local.
+                const frame: wd.Point = if (live) |l| .{ .x = l.origin_x * SUBTILES_PER_TILE, .y = l.origin_y * SUBTILES_PER_TILE } else .{ .x = 0, .y = 0 };
+                try populateRoom(gpa, region, &self.montbl, lm.?, &game_seed, &room_seed, .{ .x = sx, .y = sy, .w = ssx, .h = ssy }, frame, live, is_not_normal, &spawns);
             }
         }
 
@@ -793,6 +780,213 @@ fn deriveRoomSeed(seed: u32, rx: i32, ry: i32, idx: usize) realdrlg.abi.D2SeedSt
     h = (h ^ @as(u32, @bitCast(ry))) *% 0x100000001b3;
     h = (h ^ @as(u64, idx)) *% 0x100000001b3;
     return .{ .nSeedLow = @bitCast(@as(u32, @truncate(h ^ (h >> 32)))), .nSeedHigh = 0x29a };
+}
+
+// ---- Room population over the live map, and monster packs ---------------------------
+//
+// Two engine behaviours the density roller alone leaves out, approximated here off the live map
+// (the verified collision) rather than replayed bit for bit:
+//
+// 1. DENSITY SLOTS follow the room's COORD LIST, not its rectangle. The engine's room populate
+//    (1.10f D2Game.0x6FC67190 in D2MOO; 1.14d MONSTER_SpawnRoomMonsters 0x54ec90) walks the room's
+//    coord-list boxes and gives each (w/3)*(h/3) slots. The boxes are not exposed by the generator, so
+//    each walkable region of the room stands in for one: its bounding box gets the slots and is where
+//    the leader's position is rolled. Counting the whole rectangle, rock included, rolled about 1.5x
+//    the monsters of a live Den of Evil on the same seed.
+// 2. PACKS. A density spawn is a GROUP of MinGrp + rand(MaxGrp - MinGrp + 1) of its class (one for a
+//    fallen or scarab, whose party is the group), and every monster spawned without the minion flag
+//    brings a PARTY of PartyMin + rand(PartyMax - PartyMin + 1) minions, alternating minion1 and
+//    minion2 (1.10f D2Game.0x6FC677D0 / 0x6FC69C00). A superunique preset is its base class leading
+//    MinGrp..MaxGrp of the same class (SuperUniques.txt). The counts roll off each new unit's own
+//    seed in the engine, which nothing here models, so they roll off a stream derived from the game
+//    seed: the same seed gives the same packs, but not the engine's.
+
+const RoomBox = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// A walkable region smaller than this is no coord-list box (it gets no (w/3)*(h/3) slot anyway).
+const MIN_REGION_CELLS: u32 = 9;
+
+/// Populate one room: one density pass per walkable region when there is a live map, else over
+/// the whole rectangle (the standalone path). `frame` is subtracted from room coordinates to reach
+/// the live map's level-local cells.
+fn populateRoom(
+    gpa: std.mem.Allocator,
+    region: *realdrlg.monpop.Region,
+    montbl: *realdrlg.monpop.Tables,
+    lm: *const realdrlg.monpop.LevelMon,
+    game_seed: *realdrlg.abi.D2SeedStrc,
+    room_seed: *realdrlg.abi.D2SeedStrc,
+    room: RoomBox,
+    frame: wd.Point,
+    live: ?*const Level,
+    is_not_normal: bool,
+    out: *std.ArrayListUnmanaged(Spawn),
+) !void {
+    var boxes: std.ArrayListUnmanaged(RoomBox) = .empty;
+    defer boxes.deinit(gpa);
+    if (live) |lv| try walkableBoxes(gpa, lv, room, frame, &boxes) else try boxes.append(gpa, room);
+
+    // The engine counts a room with monsters once, however many of its boxes spawned some.
+    const before = region.n_rooms_with_monsters;
+    var any = false;
+    for (boxes.items) |b| {
+        const rctx = realdrlg.monpop.RoomCtx{ .x_start = b.x, .y_start = b.y, .x_size = b.w, .y_size = b.h };
+        var tmp: std.ArrayListUnmanaged(realdrlg.monpop.MonSpawn) = .empty;
+        defer tmp.deinit(gpa);
+        if (realdrlg.monpop.spawnRoomMonsters(region, montbl, lm, game_seed, room_seed, &rctx, is_not_normal, &tmp, gpa, null)) any = true;
+        region.n_rooms_with_monsters = before;
+        for (tmp.items) |ms| {
+            try out.append(gpa, .{ .class_id = ms.class_id, .x = ms.x, .y = ms.y, .count = ms.count, .unique = ms.flags.unique });
+        }
+    }
+    if (any) region.n_rooms_with_monsters = before + 1;
+}
+
+/// The bounding boxes of the room's walkable regions (4-connected, spawn mask), in room coordinates.
+fn walkableBoxes(gpa: std.mem.Allocator, lv: *const Level, room: RoomBox, frame: wd.Point, out: *std.ArrayListUnmanaged(RoomBox)) !void {
+    if (room.w <= 0 or room.h <= 0) return;
+    const n: usize = @intCast(room.w * room.h);
+    const seen = try gpa.alloc(bool, n);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    var stack: std.ArrayListUnmanaged(u32) = .empty;
+    defer stack.deinit(gpa);
+
+    const S = struct {
+        fn open(l: *const Level, r: RoomBox, f: wd.Point, i: i32, j: i32) bool {
+            return l.passable(r.x + i - f.x, r.y + j - f.y, wd.Colmask.spawn);
+        }
+    };
+    var start: usize = 0;
+    while (start < n) : (start += 1) {
+        if (seen[start]) continue;
+        const si: i32 = @intCast(start % @as(usize, @intCast(room.w)));
+        const sj: i32 = @intCast(start / @as(usize, @intCast(room.w)));
+        seen[start] = true;
+        if (!S.open(lv, room, frame, si, sj)) continue;
+        var minx = si;
+        var maxx = si;
+        var miny = sj;
+        var maxy = sj;
+        var cells: u32 = 0;
+        stack.clearRetainingCapacity();
+        try stack.append(gpa, @intCast(start));
+        while (stack.pop()) |cur| {
+            cells += 1;
+            const ci: i32 = @intCast(cur % @as(u32, @intCast(room.w)));
+            const cj: i32 = @intCast(cur / @as(u32, @intCast(room.w)));
+            minx = @min(minx, ci);
+            maxx = @max(maxx, ci);
+            miny = @min(miny, cj);
+            maxy = @max(maxy, cj);
+            const nbs = [_][2]i32{ .{ ci + 1, cj }, .{ ci - 1, cj }, .{ ci, cj + 1 }, .{ ci, cj - 1 } };
+            for (nbs) |nb| {
+                if (nb[0] < 0 or nb[1] < 0 or nb[0] >= room.w or nb[1] >= room.h) continue;
+                const k: usize = @intCast(nb[1] * room.w + nb[0]);
+                if (seen[k]) continue;
+                seen[k] = true;
+                if (S.open(lv, room, frame, nb[0], nb[1])) try stack.append(gpa, @intCast(k));
+            }
+        }
+        if (cells >= MIN_REGION_CELLS) {
+            try out.append(gpa, .{ .x = room.x + minx, .y = room.y + miny, .w = maxx - minx + 1, .h = maxy - miny + 1 });
+        }
+    }
+}
+
+/// A small deterministic stream for the pack rolls (see the section comment above).
+const PackRng = struct {
+    s: u32,
+    fn next(self: *PackRng) u32 {
+        self.s +%= 0x9E3779B9;
+        var z = self.s;
+        z = (z ^ (z >> 16)) *% 0x85EBCA6B;
+        z = (z ^ (z >> 13)) *% 0xC2B2AE35;
+        return z ^ (z >> 16);
+    }
+    /// 0 .. n-1 (0 when n <= 0).
+    fn below(self: *PackRng, n: i32) i32 {
+        if (n <= 0) return 0;
+        return @intCast(self.next() % @as(u32, @intCast(n)));
+    }
+};
+
+/// Expand every spawn into the monsters it stands for — group, party and superunique pack — each on
+/// a free floor cell of its own near its leader. Positions are world subtiles. Caller owns the result.
+fn expandPacks(gpa: std.mem.Allocator, montbl: *const realdrlg.monpop.Tables, lv: *const Level, seed: u32, level_id: u16, spawns: []const Spawn) ![]Spawn {
+    var out: std.ArrayListUnmanaged(Spawn) = .empty;
+    errdefer out.deinit(gpa);
+    var taken: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer taken.deinit(gpa);
+    var rng = PackRng{ .s = seed ^ (@as(u32, level_id) *% 0x01000193) };
+
+    const Place = struct {
+        lv: *const Level,
+        taken: *std.AutoHashMapUnmanaged(u64, void),
+        fn key(x: i32, y: i32) u64 {
+            return (@as(u64, @as(u32, @bitCast(x))) << 32) | @as(u32, @bitCast(y));
+        }
+        fn ok(ctx: @This(), px: i32, py: i32) bool {
+            return ctx.lv.passable(px, py, wd.Colmask.spawn) and !ctx.taken.contains(key(px, py));
+        }
+        /// A free, untaken cell within `radius` of world (wx,wy), claimed; null if there is none.
+        fn claim(self: @This(), gpa_: std.mem.Allocator, wx: i32, wy: i32, radius: i32) !?wd.Point {
+            const local = self.lv.fromWorld(.{ .x = wx, .y = wy });
+            const found = wd.ringSearch(self, local.x, local.y, radius, ok) orelse return null;
+            try self.taken.put(gpa_, key(found.x, found.y), {});
+            return self.lv.toWorld(found);
+        }
+    };
+    const place = Place{ .lv = lv, .taken = &taken };
+
+    for (spawns) |sp| {
+        var class_id = sp.class_id;
+        var group: i32 = 1;
+        var unique = sp.unique;
+        if (sp.preset) {
+            if (montbl.superUnique(sp.class_id)) |su| {
+                class_id = su.class_id;
+                unique = true;
+                group = 1 + su.min_grp + rng.below(su.max_grp - su.min_grp + 1);
+            }
+        } else if (!sp.unique) {
+            if (montbl.stat(class_id)) |ms| {
+                const fallen_or_scarab = ms.base_id == 19 or ms.base_id == 91;
+                const lo: i32 = if (fallen_or_scarab) 1 else ms.min_grp;
+                const hi: i32 = if (fallen_or_scarab) 1 else ms.max_grp;
+                if (lo > 0 and hi >= lo) group = lo + rng.below(hi - lo + 1);
+            }
+        }
+        if (class_id < 0) continue;
+
+        const leader = (try place.claim(gpa, sp.x, sp.y, 12)) orelse wd.Point{ .x = sp.x, .y = sp.y };
+        var g: i32 = 0;
+        while (g < group) : (g += 1) {
+            const at: wd.Point = if (g == 0) leader else (try place.claim(gpa, leader.x + rng.below(7) - 3, leader.y + rng.below(7) - 3, 6)) orelse continue;
+            try out.append(gpa, .{
+                .class_id = class_id,
+                .x = at.x,
+                .y = at.y,
+                .count = 1,
+                .unique = unique and g == 0,
+                .preset = sp.preset and g == 0,
+            });
+            // The party every monster spawned without the minion flag brings along.
+            const ms = montbl.stat(class_id) orelse continue;
+            if (ms.minion[0] < 0 or ms.party_max <= 0) continue;
+            const party = ms.party_min + rng.below(ms.party_max - ms.party_min + 1);
+            const alternate: i32 = if (ms.minion[1] >= 0) 1 else 0;
+            var idx: i32 = 0;
+            var m: i32 = 0;
+            while (m < party) : (m += 1) {
+                const mc = ms.minion[@intCast(idx)];
+                idx = if (idx >= alternate) 0 else idx + 1;
+                const mat = (try place.claim(gpa, at.x + rng.below(7) - 3, at.y + rng.below(7) - 3, 6)) orelse continue;
+                try out.append(gpa, .{ .class_id = mc, .x = mat.x, .y = mat.y, .count = 1, .unique = false });
+            }
+        }
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 test "generatePopulated: monster-bearing level yields spawns + entry point" {
