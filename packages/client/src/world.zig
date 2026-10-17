@@ -676,8 +676,9 @@ pub const World = struct {
         const guid = std.mem.readInt(u32, buf[4..8], .little);
 
         // 5 out of a container, 12 out of a shop, 15 out of the belt (a potion drunk): the record
-        // still names the place it left, so it must not be re-read.
-        if (op == 0x9c and (action == 0x05 or action == 0x0c or action == 0x0f)) {
+        // still names the place it left, so it must not be re-read. A player's item leaving its
+        // container comes as 0x9D action 5 (a sale to a vendor, for one): the same.
+        if ((op == 0x9c and (action == 0x05 or action == 0x0c or action == 0x0f)) or (op == 0x9d and action == 0x05)) {
             if (self.items.getPtr(guid)) |owned| owned.where = .gone;
             return;
         }
@@ -1280,6 +1281,21 @@ test "a vendor's stock is in its store, not in the player's bag" {
     const it = w.items.get(8).?;
     try std.testing.expectEqual(Where.store, it.where);
     try std.testing.expectEqual(@as(u32, 0), it.owner);
+}
+
+test "an item sold to a vendor leaves the bag" {
+    var w = World.init(std.testing.allocator);
+    defer w.deinit();
+    w.local_player_guid = 1;
+    // d2host (1.12), a Scroll of Identify sold to Charsi: out of the player's bag (0x9D action 5)...
+    const out = [_]u8{ 0x9d, 0x05, 0x19, 0x10, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x30, 0x20, 0xa2, 0x08, 0x65, 0x00, 0x52, 0x92, 0x36, 0x37, 0x06, 0x02 };
+    try w.items.put(7, .{ .item = .{}, .where = .stored, .owner = 1 });
+    w.apply(&out);
+    try std.testing.expectEqual(Where.gone, w.items.get(7).?.where);
+    // ...and into her store under a new id (0x9C action 0x0B)
+    const in = [_]u8{ 0x9c, 0x0b, 0x14, 0x10, 0x35, 0x00, 0x00, 0x00, 0x10, 0x00, 0xa2, 0x00, 0x65, 0x00, 0x12, 0x98, 0x36, 0x37, 0x06, 0x02 };
+    w.apply(&in);
+    try std.testing.expectEqual(Where.store, w.items.get(0x35).?.where);
 }
 
 test "coverage counts a handled packet as applied and an unknown one as ignored" {
