@@ -55,9 +55,22 @@ typedef struct D2GameObject {
     int32_t operate_fn; /* objects: Objects.txt OperateFn */
 } D2GameObject;
 
+typedef struct D2GameItem {
+    uint8_t code[4]; /* NUL-padded */
+    int32_t dest;    /* 0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 6 socketed */
+    int32_t body_loc, x, y, page, quality;
+    uint32_t flags;
+    int32_t n_stats, bit_len;
+} D2GameItem;
+
+/* The items of a .d2s (1.14d or D2R), up to `cap`; returns how many there are. */
+int32_t d2game_save_items(const uint8_t *bytes, size_t len, D2GameItem *out, int32_t cap);
+
 /* A game on `opt`, with the player from a .d2s (null / 0 length: a fresh level 1 sorceress). */
 D2Game *d2game_create(const D2GameOptions *opt, const uint8_t *d2s, size_t d2s_len);
 void d2game_destroy(D2Game *game);
+/* Why the last d2game_create on this thread failed. */
+const char *d2game_last_error(void);
 
 /* Advance `frames` frames; returns the frames run. */
 int32_t d2game_step(D2Game *game, int32_t frames);

@@ -144,16 +144,18 @@ fn specFromSave(gpa: std.mem.Allocator, bytes: []const u8, out_skills: *std.Arra
         spec.skill_points = @intCast(a.newskills);
         spec.experience = @intCast(a.experience);
         spec.gold = @intCast(a.gold);
-        // Life, mana and stamina are stored << 8.
-        spec.max_life = @intCast(a.maxhp >> 8);
-        spec.life = @intCast(a.hp >> 8);
-        spec.max_mana = @intCast(a.maxmana >> 8);
-        spec.mana = @intCast(a.mana >> 8);
-        spec.max_stamina = @intCast(a.maxstamina >> 8);
-        spec.stamina = @intCast(a.stamina >> 8);
+        // parseAttributes has already shifted the 8.8 life, mana and stamina down to whole points.
+        spec.max_life = @intCast(a.maxhp);
+        spec.life = @intCast(a.hp);
+        spec.max_mana = @intCast(a.maxmana);
+        spec.mana = @intCast(a.mana);
+        spec.max_stamina = @intCast(a.maxstamina);
+        spec.stamina = @intCast(a.stamina);
     } else {
         spec.level = s.header.level;
     }
+    if (s.header.left_skill < sim.skill.MAX_SKILLS) spec.left_skill = @intCast(s.header.left_skill);
+    if (s.header.right_skill < sim.skill.MAX_SKILLS) spec.right_skill = @intCast(s.header.right_skill);
 
     // Hard points: the 30 class skills in class order.
     var levels: [sim.skill.MAX_SKILLS]i16 = [_]i16{0} ** sim.skill.MAX_SKILLS;
@@ -226,13 +228,37 @@ fn specFromSave(gpa: std.mem.Allocator, bytes: []const u8, out_skills: *std.Arra
     return spec;
 }
 
+/// Why the last d2game_create on this thread failed ("" after a success).
+threadlocal var g_last_error: [128]u8 = [_]u8{0} ** 128;
+
+fn setError(comptime what: []const u8, err: ?anyerror) void {
+    var buf: [128]u8 = undefined;
+    const msg = if (err) |e| std.fmt.bufPrint(&buf, what ++ ": {s}", .{@errorName(e)}) catch what else what;
+    const n = @min(msg.len, g_last_error.len - 1);
+    @memcpy(g_last_error[0..n], msg[0..n]);
+    g_last_error[n] = 0;
+}
+
+/// A NUL-terminated reason for the last failed d2game_create on this thread.
+export fn d2game_last_error() [*:0]const u8 {
+    return @ptrCast(&g_last_error);
+}
+
 export fn d2game_create(opt: ?*const D2GameOptions, d2s: ?[*]const u8, d2s_len: usize) ?*Session {
-    const o = opt orelse return null;
-    const diff = diffFromInt(o.difficulty) orelse return null;
+    setError("", null);
+    const o = opt orelse {
+        setError("no options", null);
+        return null;
+    };
+    const diff = diffFromInt(o.difficulty) orelse {
+        setError("difficulty is not 0, 1 or 2", null);
+        return null;
+    };
     const s = pa.create(Session) catch return null;
     s.* = .{ .gi = gs.GameInstance.init(pa, 1, o.seed, 0, diff), .client = undefined };
     s.gi.setLevel(@intCast(@max(1, o.level_id)));
-    _ = s.gi.generateLevel() catch {
+    _ = s.gi.generateLevel() catch |e| {
+        setError("generating the start level", e);
         s.gi.deinit();
         pa.destroy(s);
         return null;
@@ -240,7 +266,8 @@ export fn d2game_create(opt: ?*const D2GameOptions, d2s: ?[*]const u8, d2s_len: 
     var spec = gs.PlayerSpec{ .name = "Proxy", .skills = &.{} };
     if (d2s) |p| {
         if (d2s_len > 0) {
-            spec = specFromSave(pa, p[0..d2s_len], &s.skills, &s.name) catch {
+            spec = specFromSave(pa, p[0..d2s_len], &s.skills, &s.name) catch |e| {
+                setError("reading the save", e);
                 s.skills.deinit(pa);
                 s.gi.deinit();
                 pa.destroy(s);
@@ -249,7 +276,8 @@ export fn d2game_create(opt: ?*const D2GameOptions, d2s: ?[*]const u8, d2s_len: 
         }
     }
     if (o.x != 0 or o.y != 0) spec.at = .{ o.x, o.y };
-    s.client = s.gi.addPlayer(-1, spec) catch {
+    s.client = s.gi.addPlayer(-1, spec) catch |e| {
+        setError("joining the player", e);
         s.skills.deinit(pa);
         s.gi.deinit();
         pa.destroy(s);
@@ -499,4 +527,49 @@ test "a session joins a fresh sorceress in the Den of Evil and plays frames" {
     _ = d2game_player(s, &p);
     try std.testing.expect(p.x != before or p.y != 0);
     try std.testing.expectEqual(@as(u64, 50), d2game_frame(s));
+}
+
+/// Must match `D2GameItem` in d2game.h.
+pub const D2GameItem = extern struct {
+    code: [4]u8, // NUL-padded
+    dest: i32, // 0 stored, 1 equipped, 2 belt, 3 ground, 4 cursor, 6 socketed
+    body_loc: i32, // equipped: 1 head, 2 neck, 3 torso, 4 right hand, 5 left hand, ... 8 belt, 9 feet
+    x: i32, // belt: the cell; stored: the grid column
+    y: i32,
+    page: i32, // stored: 1 inventory, 4 cube, 5 stash
+    quality: i32, // 1 low, 2 normal, 3 superior, 4 magic, 5 set, 6 rare, 7 unique, 8 crafted
+    flags: u32,
+    n_stats: i32,
+    bit_len: i32,
+};
+
+/// The items of a `.d2s` (1.14d or D2R), up to `cap`: returns how many the player carries
+/// including socketed ones, or a negative status for an unreadable save.
+export fn d2game_save_items(bytes: ?[*]const u8, len: usize, out: ?[*]D2GameItem, cap: i32) i32 {
+    const b = bytes orelse return -1;
+    const s = save.parse(b[0..len]) catch return -2;
+    var n: i32 = 0;
+    var it = s.items.iterator();
+    while (it.next()) |item| {
+        if (out) |o| {
+            if (n < cap) {
+                var code = [_]u8{0} ** 4;
+                @memcpy(code[0..item.code_len], item.code[0..item.code_len]);
+                o[@intCast(n)] = .{
+                    .code = code,
+                    .dest = item.dest,
+                    .body_loc = item.body_loc,
+                    .x = item.x,
+                    .y = item.y,
+                    .page = item.page_raw,
+                    .quality = @intFromEnum(item.quality),
+                    .flags = item.flags,
+                    .n_stats = item.n_stats,
+                    .bit_len = @intCast(item.bit_len),
+                };
+            }
+        }
+        n += 1;
+    }
+    return n;
 }
