@@ -96,6 +96,18 @@ int32_t d2game_belt(const D2Game *game, uint8_t out[64]); /* 16 cells x 4-byte M
 int32_t d2game_items(const D2Game *game, D2GameItem *out, int32_t cap);
 int32_t d2game_bag_to_belt(D2Game *game, int32_t x, int32_t y); /* the belt cell, or -1 */
 int32_t d2game_use_bag(D2Game *game, int32_t x, int32_t y);     /* 1 drunk */
+
+/* An item lying on the player's level. class_id: the engine's item txt id (Weapons, Armor, Misc rows). */
+typedef struct D2GameGround {
+    uint32_t guid;
+    int32_t class_id;
+    uint8_t code[4];
+    int32_t x, y;
+    int32_t quantity; /* gold: the amount */
+    int32_t quality;  /* 1 low .. 8 crafted; 0 gold */
+} D2GameGround;
+int32_t d2game_ground(D2Game *game, D2GameGround *out, int32_t cap);
+int32_t d2game_pick(D2Game *game, uint32_t guid); /* 1 picked; 0 out of reach or gone */
 int32_t d2game_skill_level(const D2Game *game, int32_t skill_id);
 int32_t d2game_monsters_left(D2Game *game, int32_t level_id);
 

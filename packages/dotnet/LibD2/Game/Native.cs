@@ -76,6 +76,23 @@ public struct SaveItem
     public string Code => System.Text.Encoding.ASCII.GetString(CodeBytes).TrimEnd('\0', ' ');
 }
 
+/// <summary>Layout of <c>D2GameGround</c> in d2game.h: an item lying on the player's level.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct GroundItem
+{
+    public uint Guid;
+    /// <summary>The engine's item txt id (Weapons, Armor, Misc rows in order); -1 unknown.</summary>
+    public int ClassId;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] CodeBytes;
+    public int X, Y;
+    /// <summary>Gold: the amount.</summary>
+    public int Quantity;
+    /// <summary>1 low .. 8 crafted; 0 for gold.</summary>
+    public int Quality;
+
+    public string Code => System.Text.Encoding.ASCII.GetString(CodeBytes).TrimEnd('\0', ' ');
+}
+
 /// <summary>The raw d2game entry points; <see cref="Session"/> is the public surface.</summary>
 internal static class Native
 {
@@ -152,4 +169,10 @@ internal static class Native
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int d2game_use_bag(IntPtr game, int x, int y);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int d2game_ground(IntPtr game, [Out] GroundItem[]? outArr, int cap);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int d2game_pick(IntPtr game, uint guid);
 }

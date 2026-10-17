@@ -1585,6 +1585,10 @@ pub const GameInstance = struct {
             }
             // The pile vanishing reaches every client (incl. the picker) via the ground-
             // item exit pass -> RemoveObject.
+        } else if (c.book != null and self.pickIntoBeltOrBag(c, gi)) {
+            // A player joined from a save keeps its belt and bag by item code (see `Client.bag`):
+            // a potion goes into the belt while it has room, a one-cell item into the bag.
+            _ = c.known_items.remove(gi.guid);
         } else {
             // Store it in the server-side inventory. Resolve the grid footprint from the item tables
             // (default 1x1 when unknown); a FULL inventory rejects the pickup, leaving it on the ground.
@@ -4363,16 +4367,65 @@ pub const GameInstance = struct {
         return true;
     }
 
+    /// A ground item into a save-joined player's belt (a potion, while a cell is free: the engine
+    /// belts a picked-up potion) or bag (an item one cell large, into the first free cell, row by
+    /// row). False when it fits neither: a larger item, or no room.
+    fn pickIntoBeltOrBag(self: *GameInstance, c: *Client, gi: sim.levelstate.GroundItem) bool {
+        const code = std.mem.sliceTo(&gi.code, 0);
+        var cell = BeltCell{};
+        @memcpy(cell.code[0..@min(code.len, 3)], code[0..@min(code.len, 3)]);
+        if (beltable(code)) {
+            var b: u8 = 0;
+            while (b < @min(c.belt_cells, 16)) : (b += 1) {
+                if (c.belt[b].empty()) {
+                    c.belt[b] = cell;
+                    return true;
+                }
+            }
+        }
+        const dims: [2]u8 = if (self.item_tables) |*t| (t.itemDims(code) orelse .{ 1, 1 }) else .{ 1, 1 };
+        if (dims[0] != 1 or dims[1] != 1) return false;
+        for (&c.bag) |*slot| {
+            if (slot.empty()) {
+                slot.* = cell;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Pick up the ground item `guid` on the player's level, as the client's 0x16 does: only within
+    /// the engine's reach of it. True when it left the ground.
+    pub fn pickGround(self: *GameInstance, c: *Client, guid: u32) bool {
+        const ls = self.levels.get(c.level_id) orelse return false;
+        const before = ls.ground_items.items.len;
+        self.pickUpItem(c, ls, .{ .unit_type = 4, .guid = guid, .to_cursor = 0 });
+        return ls.ground_items.items.len < before;
+    }
+
+    /// The compiled item class of `code` (Weapons, then Armor, then Misc rows: the engine's item
+    /// txt id), or -1.
+    pub fn itemClassId(self: *GameInstance, code: []const u8) i32 {
+        self.ensureItemTables() catch return -1;
+        const t = &self.item_tables.?;
+        for (t.item_classes, 0..) |ic, i| if (std.mem.eql(u8, ic.code, code)) return @intCast(i);
+        return -1;
+    }
+
+    /// What goes into a belt: healing, mana and rejuvenation potions, and stamina, antidote and
+    /// thawing potions.
+    fn beltable(code: []const u8) bool {
+        return std.mem.startsWith(u8, code, "hp") or std.mem.startsWith(u8, code, "mp") or std.mem.startsWith(u8, code, "rv") or
+            std.mem.eql(u8, code, "vps") or std.mem.eql(u8, code, "yps") or std.mem.eql(u8, code, "wms");
+    }
+
     /// Shift-click on a potion in the inventory: it goes into the first empty belt cell (by index:
     /// the bottom row left to right, then the row above). The cell, or -1 when the item is no potion
     /// or the belt has no room.
     pub fn bagToBelt(self: *GameInstance, c: *Client, slot: u8) i32 {
         _ = self;
         if (slot >= 40 or c.bag[slot].empty()) return -1;
-        const code = std.mem.sliceTo(&c.bag[slot].code, 0);
-        const beltable = std.mem.startsWith(u8, code, "hp") or std.mem.startsWith(u8, code, "mp") or std.mem.startsWith(u8, code, "rv") or
-            std.mem.eql(u8, code, "vps") or std.mem.eql(u8, code, "yps") or std.mem.eql(u8, code, "wms");
-        if (!beltable) return -1;
+        if (!beltable(std.mem.sliceTo(&c.bag[slot].code, 0))) return -1;
         var cell: u8 = 0;
         while (cell < @min(c.belt_cells, 16)) : (cell += 1) {
             if (c.belt[cell].empty()) {
@@ -7194,6 +7247,31 @@ test "attribute and skill points go in as the character screen and skill tree sp
     try std.testing.expect(gi.allocSkill(c, 36));
     try std.testing.expectEqual(@as(i32, 2), c.book.?.get(36));
     try std.testing.expect(!gi.allocSkill(c, 37)); // no points left
+}
+
+test "a save-joined player picks a potion into the belt, a scroll into the bag, gold into gold" {
+    const gpa = std.testing.allocator;
+    var gi = GameInstance.init(gpa, 7, 1890709803, 0, .normal);
+    gi.setLevel(8);
+    defer gi.deinit();
+    _ = try gi.generateLevel();
+    var spec: PlayerSpec = .{ .name = "Mindy", .level = 2, .max_life = 49, .max_mana = 37, .skills = &.{.{ .id = 36, .level = 1 }}, .belt_cells = 8 };
+    for (0..7) |i| spec.belt[i] = .{ .code = .{ 'h', 'p', '1', 0 } };
+    const c = try gi.addPlayer(-1, spec);
+    const ls = gi.levels.get(c.level_id).?;
+    const me = ls.units.getPtr(c.player_guid).?;
+    try ls.ground_items.append(gpa, .{ .guid = 901, .x = me.x + 2, .y = me.y, .code = .{ 'm', 'p', '1', 0 } });
+    try ls.ground_items.append(gpa, .{ .guid = 902, .x = me.x, .y = me.y + 2, .code = .{ 'i', 's', 'c', 0 } });
+    try ls.ground_items.append(gpa, .{ .guid = 903, .x = me.x + 1, .y = me.y + 1, .code = .{ 'g', 'l', 'd', 0 }, .is_gold = true, .quantity = 37 });
+    try ls.ground_items.append(gpa, .{ .guid = 904, .x = me.x + 30, .y = me.y, .code = .{ 'm', 'p', '1', 0 } });
+    try std.testing.expect(gi.itemClassId("mp1") > 500);
+    try std.testing.expect(gi.pickGround(c, 901));
+    try std.testing.expectEqualStrings("mp1", std.mem.sliceTo(&c.belt[7].code, 0));
+    try std.testing.expect(gi.pickGround(c, 902));
+    try std.testing.expectEqualStrings("isc", std.mem.sliceTo(&c.bag[0].code, 0));
+    try std.testing.expect(gi.pickGround(c, 903));
+    try std.testing.expectEqual(@as(i32, 37), me.get(.gold));
+    try std.testing.expect(!gi.pickGround(c, 904)); // out of reach
 }
 
 test "a bag potion shift-clicked goes into the first free belt cell; one right-clicked is drunk" {

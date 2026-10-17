@@ -531,6 +531,45 @@ export fn d2game_items(session: ?*const Session, out: ?[*]D2GameItem, cap: i32) 
     return n;
 }
 
+/// One item lying on the player's level.
+pub const D2GameGround = extern struct {
+    guid: u32,
+    class_id: i32, // the engine's item txt id (Weapons, Armor, Misc rows in order); -1 unknown
+    code: [4]u8, // NUL-padded
+    x: i32,
+    y: i32,
+    quantity: i32, // gold: the amount
+    quality: i32, // 1 low, 2 normal, 3 superior, 4 magic, 5 set, 6 rare, 7 unique, 8 crafted; 0 gold
+};
+
+/// The items lying on the player's level, up to `cap`; returns how many there are.
+export fn d2game_ground(session: ?*Session, out: ?[*]D2GameGround, cap: i32) i32 {
+    const s = session orelse return -1;
+    const ls = s.gi.levels.get(s.client.level_id) orelse return 0;
+    var n: i32 = 0;
+    for (ls.ground_items.items) |g| {
+        if (out) |o| {
+            if (n < cap) o[@intCast(n)] = .{
+                .guid = g.guid,
+                .class_id = s.gi.itemClassId(std.mem.sliceTo(&g.code, 0)),
+                .code = g.code,
+                .x = g.x,
+                .y = g.y,
+                .quantity = g.quantity,
+                .quality = if (g.is_gold) 0 else @intFromEnum(g.drop.quality),
+            };
+        }
+        n += 1;
+    }
+    return n;
+}
+
+/// Pick up the ground item `guid` (within the engine's reach of it, 5 subtiles): 1 picked, 0 not.
+export fn d2game_pick(session: ?*Session, guid: u32) i32 {
+    const s = session orelse return -1;
+    return @intFromBool(s.gi.pickGround(s.client, guid));
+}
+
 /// Shift-click the potion in inventory cell (x, y) into the belt: the belt cell it went to, or -1.
 export fn d2game_bag_to_belt(session: ?*Session, x: i32, y: i32) i32 {
     const s = session orelse return -1;

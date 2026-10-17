@@ -103,6 +103,18 @@ public sealed class Session : IDisposable
     /// <summary>Drink the potion in inventory cell (x, y), as a right click on it does.</summary>
     public bool UseBag(int x, int y) => Native.d2game_use_bag(H, x, y) == 1;
 
+    /// <summary>The items lying on the player's level.</summary>
+    public GroundItem[] Ground()
+    {
+        var n = Native.d2game_ground(H, null, 0);
+        var arr = new GroundItem[Math.Max(0, n)];
+        if (n > 0) Native.d2game_ground(H, arr, n);
+        return arr;
+    }
+
+    /// <summary>Pick up a ground item, within the engine's reach of it (5 subtiles): true when it went.</summary>
+    public bool Pick(uint guid) => Native.d2game_pick(H, guid) == 1;
+
     public int SkillLevel(int skillId) => Native.d2game_skill_level(H, skillId);
 
     /// <summary>The items of a .d2s (1.14d or D2R).</summary>
